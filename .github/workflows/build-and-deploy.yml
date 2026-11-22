@@ -29,6 +29,11 @@ jobs:
         with:
           version: 3.1.74
 
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
       - name: Install build tools
         run: |
           sudo apt-get update
@@ -54,8 +59,6 @@ jobs:
       - name: Run source tests
         working-directory: ${{ steps.source.outputs.project_root }}
         run: node --test azahar-web/tests/*.test.mjs
-        env:
-          PATH: /opt/hostedtoolcache/node/22.*/x64/bin:${{ env.PATH }}
 
       - name: Fetch pinned Azahar sources and apply patches
         working-directory: ${{ steps.source.outputs.project_root }}
