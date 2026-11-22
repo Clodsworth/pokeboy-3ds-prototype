@@ -1,0 +1,2567 @@
+diff --git a/src/audio_core/libretro_input.cpp b/src/audio_core/libretro_input.cpp
+index 77a0aeb..7b48706 100644
+--- a/src/audio_core/libretro_input.cpp
++++ b/src/audio_core/libretro_input.cpp
+@@ -64 +64,5 @@ struct LibRetroInput::Impl {
++#ifdef __EMSCRIPTEN__
++        // The web frontend reads without blocking and must drain a full frame of 48 kHz audio.
++        read_buffer.resize(4096);
++#else
+         // Keep this small enough that RetroArch's microphone_driver_read can
+@@ -72,2 +76,3 @@ struct LibRetroInput::Impl {
+         read_buffer.resize(128);
++#endif
+     }
+@@ -178,3 +183,7 @@ void LibRetroInput::StartSampling(const InputParameters& params) {
+     // read can hang because the CoreAudio callback hasn't fired yet.
++#ifdef __EMSCRIPTEN__
++    impl->warmup_frames = 0;
++#else
+     impl->warmup_frames = 10;
++#endif
+     LOG_INFO(Audio, "LibRetro microphone sampling started at {} Hz, {} bit", params.sample_rate,
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index e99de6a..dccab90 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -147,7 +147,7 @@ CMAKE_DEPENDENT_OPTION(ENABLE_LIBUSB "Enable libusb for GameCube Adapter support
+ CMAKE_DEPENDENT_OPTION(ENABLE_FFMPEG "Enable features which require FFmpeg to function" ON "ENABLE_QT" OFF)
+ 
+ CMAKE_DEPENDENT_OPTION(ENABLE_SOFTWARE_RENDERER "Enables the software renderer" ON "NOT ANDROID" OFF)
+-CMAKE_DEPENDENT_OPTION(ENABLE_OPENGL "Enables the OpenGL renderer" ${DEFAULT_ENABLE_OPENGL} "NOT APPLE" OFF)
++CMAKE_DEPENDENT_OPTION(ENABLE_OPENGL "Enables the OpenGL renderer" ${DEFAULT_ENABLE_OPENGL} "NOT APPLE OR EMSCRIPTEN" OFF)
+ # NetBSD doesn't support Vulkan yet, remove this check when it does.
+ CMAKE_DEPENDENT_OPTION(ENABLE_VULKAN "Enables the Vulkan renderer" ON "NOT (BSD MATCHES \"NetBSD\")" OFF)
+ 
+@@ -317,7 +317,7 @@ function(check_submodules_present)
+         endif()
+     endforeach()
+ endfunction()
+-if (EXISTS "${PROJECT_SOURCE_DIR}/.git/objects")
++if (EXISTS "${PROJECT_SOURCE_DIR}/.git/objects" AND NOT EMSCRIPTEN)
+     # only check submodules when source is obtained via Git
+     check_submodules_present()
+ endif()
+@@ -389,7 +389,9 @@ set(CMAKE_VISIBILITY_INLINES_HIDDEN NO)
+ # set up output paths for executable binaries
+ set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${PROJECT_BINARY_DIR}/bin/$<CONFIG>)
+ 
+-if (ENABLE_LIBRETRO)
++# GAEMBOY wasm: the web build links the core statically into one module, so no PIC (GOT access
++# would slow down every global in the hot paths).
++if (ENABLE_LIBRETRO AND NOT EMSCRIPTEN)
+   set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+ endif()
+ 
+diff --git a/externals/CMakeLists.txt b/externals/CMakeLists.txt
+index cfb63c3..bb2d6f6 100644
+--- a/externals/CMakeLists.txt
++++ b/externals/CMakeLists.txt
+@@ -540,3 +540,10 @@ if(NOT USE_SYSTEM_XXHASH)
+         message(STATUS "Disabling SIMD for xxHash")
+     endif()
+ endif()
++
++# GAEMBOY wasm: robin-map normally comes bundled with dynarmic, which is not built on GENERIC targets
++if (NOT TARGET tsl::robin_map AND EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/robin-map/include)
++    add_library(robin_map INTERFACE)
++    target_include_directories(robin_map INTERFACE ./robin-map/include)
++    add_library(tsl::robin_map ALIAS robin_map)
++endif()
+diff --git a/externals/libressl b/externals/libressl
+--- a/externals/libressl
++++ b/externals/libressl
+@@ -1 +1 @@
+-Subproject commit 88b8e41b71099fabc57813bc06d8bc1aba050a19
++Subproject commit 88b8e41b71099fabc57813bc06d8bc1aba050a19-dirty
+diff --git a/src/citra_libretro/CMakeLists.txt b/src/citra_libretro/CMakeLists.txt
+index e28f994..4afb381 100644
+--- a/src/citra_libretro/CMakeLists.txt
++++ b/src/citra_libretro/CMakeLists.txt
+@@ -99,3 +99,22 @@ else()
+ endif()
+ 
+ add_custom_target(azahar_libretro DEPENDS citra_libretro)
++
++# GAEMBOY wasm: standalone Emscripten executable = Azahar libretro core + a minimal web frontend
++# (GAEMBOY3DS_FRONTEND points at gaemboy3ds_web.cpp, link flags come from GAEMBOY3DS_LINK_FLAGS).
++if (EMSCRIPTEN AND DEFINED GAEMBOY3DS_FRONTEND)
++    add_executable(gaemboy3ds
++            ${GAEMBOY3DS_FRONTEND}
++            citra_libretro.cpp
++            $<TARGET_OBJECTS:citra_libretro_common>)
++    target_compile_definitions(gaemboy3ds PRIVATE HAVE_LIBRETRO)
++    if (ENABLE_OPENGL)
++        target_compile_definitions(citra_libretro_common PRIVATE USING_GLES)
++        target_compile_definitions(gaemboy3ds PRIVATE USING_GLES)
++        target_link_libraries(gaemboy3ds PRIVATE glad)
++    endif()
++    target_link_libraries(gaemboy3ds PRIVATE citra_common citra_core video_core audio_core
++            input_common Boost::boost dds-ktx libretro tsl::robin_map Threads::Threads)
++    separate_arguments(_gaemboy3ds_link_flags UNIX_COMMAND "${GAEMBOY3DS_LINK_FLAGS}")
++    target_link_options(gaemboy3ds PRIVATE ${_gaemboy3ds_link_flags})
++endif()
+diff --git a/src/citra_libretro/emu_window/libretro_window.cpp b/src/citra_libretro/emu_window/libretro_window.cpp
+index 307e14a..f6bdb74 100644
+--- a/src/citra_libretro/emu_window/libretro_window.cpp
++++ b/src/citra_libretro/emu_window/libretro_window.cpp
+@@ -47,7 +47,9 @@ void ResetGLState() {
+     glBlendFuncSeparate(GL_ONE, GL_ZERO, GL_ONE, GL_ZERO);
+     glBlendColor(0, 0, 0, 0);
+ 
++#ifndef __EMSCRIPTEN__
+     glDisable(GL_COLOR_LOGIC_OP);
++#endif
+ 
+     glDisable(GL_DITHER);
+ 
+@@ -130,6 +132,9 @@ void EmuWindow_LibRetro::SwapBuffers() {
+             // Landscape display dimensions (transposed from portrait storage)
+             const u32 native_w = info.height;
+             const u32 native_h = info.width;
++            // 800px wide mode squeezed into a 400px rect: average column pairs instead of
++            // dropping every other column.
++            const bool halve_x = native_w == rect_w * 2;
+ 
+             for (u32 oy = 0; oy < rect_h; oy++) {
+                 for (u32 ox = 0; ox < rect_w; ox++) {
+@@ -145,9 +150,15 @@ void EmuWindow_LibRetro::SwapBuffers() {
+                                            static_cast<size_t>(rect.left + ox) * 4;
+ 
+                     // RGBA -> XRGB8888 (little-endian: B, G, R, 0)
+-                    data[dst_off + 0] = src[2];
+-                    data[dst_off + 1] = src[1];
+-                    data[dst_off + 2] = src[0];
++                    if (halve_x && src_off + 7 < info.pixels.size()) {
++                        data[dst_off + 0] = static_cast<u8>((src[2] + src[6] + 1) >> 1);
++                        data[dst_off + 1] = static_cast<u8>((src[1] + src[5] + 1) >> 1);
++                        data[dst_off + 2] = static_cast<u8>((src[0] + src[4] + 1) >> 1);
++                    } else {
++                        data[dst_off + 0] = src[2];
++                        data[dst_off + 1] = src[1];
++                        data[dst_off + 2] = src[0];
++                    }
+                     data[dst_off + 3] = 0;
+                 }
+             }
+diff --git a/src/common/expected.h b/src/common/expected.h
+index 485cf54..b0d8d99 100644
+--- a/src/common/expected.h
++++ b/src/common/expected.h
+@@ -73,7 +73,7 @@ struct expected_storage_base {
+ 
+     template <typename... Args, std::enable_if_t<std::is_constructible_v<T, Args&&...>>* = nullptr>
+     constexpr expected_storage_base(std::in_place_t, Args&&... args)
+-        : m_val{std::forward<Args>(args)...}, m_has_val{true} {}
++        : m_val(std::forward<Args>(args)...), m_has_val{true} {}
+ 
+     template <typename U, typename... Args,
+               std::enable_if_t<std::is_constructible_v<T, std::initializer_list<U>&, Args&&...>>* =
+@@ -120,7 +120,7 @@ struct expected_storage_base<T, E, true> {
+ 
+     template <typename... Args, std::enable_if_t<std::is_constructible_v<T, Args&&...>>* = nullptr>
+     constexpr expected_storage_base(std::in_place_t, Args&&... args)
+-        : m_val{std::forward<Args>(args)...}, m_has_val{true} {}
++        : m_val(std::forward<Args>(args)...), m_has_val{true} {}
+ 
+     template <typename U, typename... Args,
+               std::enable_if_t<std::is_constructible_v<T, std::initializer_list<U>&, Args&&...>>* =
+diff --git a/src/common/tar_file.cpp b/src/common/tar_file.cpp
+index 09db65d..41c9347 100644
+--- a/src/common/tar_file.cpp
++++ b/src/common/tar_file.cpp
+@@ -112,7 +112,9 @@ struct TarArchiveImpl {
+                     return Fail();
+                 }
+                 file_infos.emplace_back(TarArchive::TarFileInfo{
+-                    .name = std::string(name), .position = position, .size = h.size});
++                    .name = std::string(name),
++                    .position = static_cast<std::size_t>(position),
++                    .size = static_cast<std::size_t>(h.size)});
+             }
+ 
+             if (mtar_next(&tar) != MTAR_ESUCCESS) {
+diff --git a/src/common/thread.cpp b/src/common/thread.cpp
+index cad2108..8bcd745 100644
+--- a/src/common/thread.cpp
++++ b/src/common/thread.cpp
+@@ -98,6 +98,8 @@ void SetCurrentThreadName(const char* name) {
+     pthread_set_name_np(pthread_self(), name);
+ #elif defined(__NetBSD__)
+     pthread_setname_np(pthread_self(), "%s", (void*)name);
++#elif defined(__EMSCRIPTEN__)
++    (void)name; // no thread names in browser workers
+ #elif defined(__linux__)
+     // Linux limits thread names to 15 characters and will outright reject any
+     // attempt to set a longer name with ERANGE.
+diff --git a/src/core/CMakeLists.txt b/src/core/CMakeLists.txt
+index 814863e..d2c1caa 100644
+--- a/src/core/CMakeLists.txt
++++ b/src/core/CMakeLists.txt
+@@ -577,6 +577,13 @@ if (NOT MSVC)
+         arm/fastinterp/fastinterp_flags.h
+         arm/fastinterp/fastinterp_types.h
+     )
++    # GAEMBOY wasm: FastInterp needs the cycle table even when Dynarmic is not built
++    if (NOT ("x86_64" IN_LIST ARCHITECTURE OR "arm64" IN_LIST ARCHITECTURE))
++        target_sources(citra_core PRIVATE
++            arm/dynarmic/arm_tick_counts.cpp
++            arm/dynarmic/arm_tick_counts.h
++        )
++    endif()
+ endif()
+ 
+ if (CITRA_USE_PRECOMPILED_HEADERS)
+diff --git a/src/core/arm/fastinterp/fastinterp.cpp b/src/core/arm/fastinterp/fastinterp.cpp
+index cd24691..ac6080f 100644
+--- a/src/core/arm/fastinterp/fastinterp.cpp
++++ b/src/core/arm/fastinterp/fastinterp.cpp
+@@ -94,6 +94,7 @@ void ARM_FastInterp::Run() {
+         }
+         if (!cache_hit) {
+             DecodeBlockInto(block, pc);
++            cache_.MarkCode(block->start_pc, block->end_pc);
+         }
+ 
+         u64 executed = ExecuteBlock(block);
+@@ -159,6 +160,7 @@ void ARM_FastInterp::Step() {
+         term.cond = 0xE;
+         block->inst_count = slot + 1;
+         block->end_pc = pc + 4;
++        cache_.MarkCode(pc, pc + 4);
+     }
+ 
+     u64 executed = ExecuteBlock(block);
+diff --git a/src/core/arm/fastinterp/fastinterp_cache.h b/src/core/arm/fastinterp/fastinterp_cache.h
+index de26f90..ec8878c 100644
+--- a/src/core/arm/fastinterp/fastinterp_cache.h
++++ b/src/core/arm/fastinterp/fastinterp_cache.h
+@@ -44,6 +44,17 @@ public:
+             block.chain_target = nullptr; // Prevent dangling pointers
+         }
+         std::memset(lru_state_.data(), 0, lru_state_.size());
++        code_pages_.fill(0);
++    }
++
++    /// Record that a decoded block covers [start_addr, end_addr). Must be called
++    /// once the block's end_pc is known so InvalidateRange can skip pages that
++    /// hold no decoded code.
++    void MarkCode(u32 start_addr, u32 end_addr) {
++        const u32 last = (end_addr > start_addr ? end_addr - 1 : start_addr) >> PAGE_BITS;
++        for (u32 page = start_addr >> PAGE_BITS; page <= last; ++page) {
++            code_pages_[page >> 6] |= u64{1} << (page & 63);
++        }
+     }
+ 
+     /// Invalidate cache entries whose decoded range intersects [start_addr, start_addr+length)
+@@ -52,7 +63,22 @@ public:
+         // range: walk every entry and match on the block's own address range.
+         // inst_count is zeroed so surviving pointers to the entry (chain
+         // targets) fizzle instead of executing the stale decode.
++        if (length == 0) {
++            return;
++        }
+         const u64 end_addr = static_cast<u64>(start_addr) + length;
++        const u32 first_page = start_addr >> PAGE_BITS;
++        const u32 last_page = static_cast<u32>((end_addr - 1) >> PAGE_BITS);
++        // Fast path: HLE relocation (LDR:RO) patches thousands of single words,
++        // mostly data. Scanning all CACHE_SIZE blocks (~10MB) per word stalled
++        // scene transitions for seconds; most ranges touch no decoded code.
++        bool has_code = false;
++        for (u32 page = first_page; page <= last_page && !has_code; ++page) {
++            has_code = (code_pages_[page >> 6] >> (page & 63)) & 1;
++        }
++        if (!has_code) {
++            return;
++        }
+         for (size_t i = 0; i < CACHE_SIZE; ++i) {
+             if (tags_[i] == INVALID_TAG) {
+                 continue;
+@@ -63,6 +89,14 @@ public:
+                 blocks_[i].chain_target = nullptr;
+             }
+         }
++        // Every block overlapping a page fully inside the range was invalidated
++        // above, so those pages hold no decoded code anymore.
++        for (u32 page = first_page; page <= last_page; ++page) {
++            const u64 page_start = static_cast<u64>(page) << PAGE_BITS;
++            if (page_start >= start_addr && page_start + (u64{1} << PAGE_BITS) <= end_addr) {
++                code_pages_[page >> 6] &= ~(u64{1} << (page & 63));
++            }
++        }
+     }
+ 
+     /// Look up a block by PC (returns nullptr if not found)
+@@ -149,6 +183,11 @@ private:
+     std::array<u32, CACHE_SIZE> tags_;
+     std::array<BasicBlock, CACHE_SIZE> blocks_;
+     std::array<u8, CACHE_SETS> lru_state_;
++
++    /// One bit per 4KB guest page that may hold decoded blocks (conservative:
++    /// evicted blocks leave their bit set until the page is invalidated).
++    static constexpr u32 PAGE_BITS = 12;
++    std::array<u64, (u64{1} << (32 - PAGE_BITS)) / 64> code_pages_;
+ };
+ 
+ } // namespace Core::FastInterp
+diff --git a/src/video_core/rasterizer_cache/rasterizer_cache.h b/src/video_core/rasterizer_cache/rasterizer_cache.h
+index 7313f0d..d8feb45 100644
+--- a/src/video_core/rasterizer_cache/rasterizer_cache.h
++++ b/src/video_core/rasterizer_cache/rasterizer_cache.h
+@@ -137,7 +137,15 @@ void RasterizerCache<T>::RunGarbageCollector() {
+         // Tick-values less than or equal to the current resource-tick are possibly still in-use.
+         // Tick-values larger than the current resource-tick are not being utilized anymore and can
+         // be safely deleted.
++#ifdef __EMSCRIPTEN__
++        // GAEMBOY web: keep sentenced surfaces alive for a few frames so CreateSurface can
++        // recycle them. Under ANGLE/WebGL, deleting and recreating textures and framebuffers
++        // every frame saturates the browser GPU process.
++        constexpr u64 RecycleGraceFrames = 8;
++        if (resource_free_tick <= resource_last_used_tick + RecycleGraceFrames) {
++#else
+         if (resource_free_tick <= resource_last_used_tick) {
++#endif
+             // Resource is still in-use, skip deletion
+             it++;
+             continue;
+diff --git a/src/video_core/renderer_opengl/gl_blit_helper.cpp b/src/video_core/renderer_opengl/gl_blit_helper.cpp
+index 6f3de4e..132f6f3 100644
+--- a/src/video_core/renderer_opengl/gl_blit_helper.cpp
++++ b/src/video_core/renderer_opengl/gl_blit_helper.cpp
+@@ -49,8 +49,17 @@ OGLProgram CreateProgram(std::string_view frag, std::string_view debug_name) {
+     OGLProgram program;
+     program.SetDebugName(debug_name);
+     program.Create(HostShaders::FULL_SCREEN_TRIANGLE_VERT, frag);
++#ifdef __EMSCRIPTEN__
++    GLint prev = 0;
++    glGetIntegerv(GL_CURRENT_PROGRAM, &prev);
++    glUseProgram(program.handle);
++    if (GLint l = glGetUniformLocation(program.handle, "tex_scale"); l != -1) glUniform2f(l, 1.f, 1.f);
++    if (GLint l = glGetUniformLocation(program.handle, "tex_offset"); l != -1) glUniform2f(l, 0.f, 0.f);
++    glUseProgram(static_cast<GLuint>(prev));
++#else
+     glProgramUniform2f(program.handle, 0, 1.f, 1.f);
+     glProgramUniform2f(program.handle, 1, 0.f, 0.f);
++#endif
+     return program;
+ }
+ 
+@@ -67,11 +76,15 @@ BlitHelper::BlitHelper(const Driver& driver_)
+       gradient_y_program{CreateProgram(HostShaders::Y_GRADIENT_FRAG, "Y_GRADIENT_FRAG")},
+       refine_program{CreateProgram(HostShaders::REFINE_FRAG, "REFINE_FRAG")},
+       d24s8_to_rgba8{CreateProgram(HostShaders::D24S8_TO_RGBA8_FRAG, "D24S8_TO_RGBA8_FRAG")},
++#ifdef __EMSCRIPTEN__
++      rgba4_to_rgb5a1{CreateProgram(HostShaders::RGBA4_TO_RGB5A1_FRAG, "RGBA4_TO_RGB5A1_FRAG")} {
++#else
+       d24s8_to_rgba8_ms{
+           CreateProgram(HostShaders::D24S8_TO_RGBA8_MS_FRAG, "D24S8_TO_RGBA8_MS_FRAG")},
+       rgba4_to_rgb5a1{CreateProgram(HostShaders::RGBA4_TO_RGB5A1_FRAG, "RGBA4_TO_RGB5A1_FRAG")},
+       rgba4_to_rgb5a1_ms{
+           CreateProgram(HostShaders::RGBA4_TO_RGB5A1_MS_FRAG, "RGBA4_TO_RGB5A1_MS_FRAG")} {
++#endif
+     vao.Create();
+     read_fbo.Create();
+     draw_fbo.Create();
+@@ -120,11 +133,14 @@ bool BlitHelper::ConvertDS24S8ToRGBA8(Surface& source, Surface& dest,
+         state.Apply();
+         glActiveTexture(GL_TEXTURE1);
+ 
++#ifndef __EMSCRIPTEN__
+         if (multisample) {
+             glTexStorage2DMultisample(textarget, source.sample_count, GL_DEPTH24_STENCIL8,
+                                       temp_extent.width, temp_extent.height, true);
+ 
+-        } else {
++        } else
++#endif
++        {
+             glTexStorage2D(textarget, 1, GL_DEPTH24_STENCIL8, temp_extent.width,
+                            temp_extent.height);
+             glTexParameteri(textarget, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+@@ -137,9 +153,25 @@ bool BlitHelper::ConvertDS24S8ToRGBA8(Surface& source, Surface& dest,
+ 
+     glActiveTexture(GL_TEXTURE1);
+     if (!use_texture_view) {
++#ifdef __EMSCRIPTEN__
++        glBindFramebuffer(GL_READ_FRAMEBUFFER, read_fbo.handle);
++        glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT, textarget,
++                               source.Handle(multisample ? 3 : 1), 0);
++        glBindFramebuffer(GL_DRAW_FRAMEBUFFER, draw_fbo.handle);
++        glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT, textarget,
++                               temp_tex.handle, 0);
++        glBlitFramebuffer(copy.src_offset.x, copy.src_offset.y,
++                          copy.src_offset.x + copy.extent.width,
++                          copy.src_offset.y + copy.extent.height, copy.src_offset.x,
++                          copy.src_offset.y, copy.src_offset.x + copy.extent.width,
++                          copy.src_offset.y + copy.extent.height,
++                          GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT, GL_NEAREST);
++        state.Apply();
++#else
+         glCopyImageSubData(source.Handle(multisample ? 3 : 1), textarget, 0, copy.src_offset.x,
+                            copy.src_offset.y, 0, temp_tex.handle, textarget, 0, copy.src_offset.x,
+                            copy.src_offset.y, 0, copy.extent.width, copy.extent.height, 1);
++#endif
+     }
+     glTexParameteri(textarget, GL_DEPTH_STENCIL_TEXTURE_MODE, GL_STENCIL_INDEX);
+ 
+@@ -280,9 +312,19 @@ void BlitHelper::FilterAnime4K(Surface& surface, const VideoCore::TextureBlit& b
+     auto LUMAD = setup_temp_tex(GL_R16F, GL_RED, temp_rect.GetWidth(), temp_rect.GetHeight());
+ 
+     // Copy to SRC
++#ifdef __EMSCRIPTEN__
++    glBindFramebuffer(GL_READ_FRAMEBUFFER, read_fbo.handle);
++    glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D,
++                           surface.Handle(0), 0);
++    glBindTexture(GL_TEXTURE_2D, SRC.tex.handle);
++    glCopyTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, blit.src_rect.left, blit.src_rect.bottom,
++                        src_width, src_height);
++    state.Apply();
++#else
+     glCopyImageSubData(surface.Handle(0), GL_TEXTURE_2D, 0, blit.src_rect.left,
+                        blit.src_rect.bottom, 0, SRC.tex.handle, GL_TEXTURE_2D, 0, 0, 0, 0,
+                        src_width, src_height, 1);
++#endif
+ 
+     state.texture_units[0].texture_2d = SRC.tex.handle;
+     state.texture_units[1].texture_2d = LUMAD.tex.handle;
+@@ -332,7 +374,14 @@ void BlitHelper::FilterXbrz(Surface& surface, const VideoCore::TextureBlit& blit
+     SCOPE_EXIT({ prev_state.Apply(); });
+     state.texture_units[0].texture_2d = surface.Handle(0);
+     state.texture_units[0].target = GL_TEXTURE_2D;
++#ifdef __EMSCRIPTEN__
++    glUseProgram(xbrz_program.handle);
++    if (GLint l = glGetUniformLocation(xbrz_program.handle, "scale"); l != -1) {
++        glUniform1f(l, static_cast<GLfloat>(surface.res_scale));
++    }
++#else
+     glProgramUniform1f(xbrz_program.handle, 2, static_cast<GLfloat>(surface.res_scale));
++#endif
+     SetParams(xbrz_program, surface.RealExtent(false), blit.src_rect);
+     Draw(xbrz_program, surface.Handle(), draw_fbo.handle, blit.dst_level, blit.dst_rect);
+ }
+@@ -348,13 +397,20 @@ void BlitHelper::FilterMMPX(Surface& surface, const VideoCore::TextureBlit& blit
+ 
+ void BlitHelper::SetParams(OGLProgram& program, const VideoCore::Extent& src_extent,
+                            Common::Rectangle<u32> src_rect) {
+-    glProgramUniform2f(
+-        program.handle, 0,
+-        static_cast<float>(src_rect.right - src_rect.left) / static_cast<float>(src_extent.width),
+-        static_cast<float>(src_rect.top - src_rect.bottom) / static_cast<float>(src_extent.height));
+-    glProgramUniform2f(program.handle, 1,
+-                       static_cast<float>(src_rect.left) / static_cast<float>(src_extent.width),
+-                       static_cast<float>(src_rect.bottom) / static_cast<float>(src_extent.height));
++    const float sx =
++        static_cast<float>(src_rect.right - src_rect.left) / static_cast<float>(src_extent.width);
++    const float sy =
++        static_cast<float>(src_rect.top - src_rect.bottom) / static_cast<float>(src_extent.height);
++    const float ox = static_cast<float>(src_rect.left) / static_cast<float>(src_extent.width);
++    const float oy = static_cast<float>(src_rect.bottom) / static_cast<float>(src_extent.height);
++#ifdef __EMSCRIPTEN__
++    glUseProgram(program.handle);
++    if (GLint l = glGetUniformLocation(program.handle, "tex_scale"); l != -1) glUniform2f(l, sx, sy);
++    if (GLint l = glGetUniformLocation(program.handle, "tex_offset"); l != -1) glUniform2f(l, ox, oy);
++#else
++    glProgramUniform2f(program.handle, 0, sx, sy);
++    glProgramUniform2f(program.handle, 1, ox, oy);
++#endif
+ }
+ 
+ void BlitHelper::Draw(OGLProgram& program, GLuint dst_tex, GLuint dst_fbo, u32 dst_level,
+diff --git a/src/video_core/renderer_opengl/gl_driver.cpp b/src/video_core/renderer_opengl/gl_driver.cpp
+index 0c02521..22d6cf4 100644
+--- a/src/video_core/renderer_opengl/gl_driver.cpp
++++ b/src/video_core/renderer_opengl/gl_driver.cpp
+@@ -169,7 +169,12 @@ void Driver::CheckExtensionSupport() {
+     arb_clear_texture = GLAD_GL_ARB_clear_texture;
+     arb_get_texture_sub_image = GLAD_GL_ARB_get_texture_sub_image;
+     arb_texture_compression_bptc = GLAD_GL_ARB_texture_compression_bptc;
++#ifdef __EMSCRIPTEN__
++    // WebGL2 requires explicit getExtension("WEBGL_clip_cull_distance"); use FS/shader fallback.
++    clip_cull_distance = false;
++#else
+     clip_cull_distance = !is_gles || GLAD_GL_EXT_clip_cull_distance;
++#endif
+     ext_texture_compression_s3tc = GLAD_GL_EXT_texture_compression_s3tc;
+     ext_shader_framebuffer_fetch = GLAD_GL_EXT_shader_framebuffer_fetch;
+     arm_shader_framebuffer_fetch = GLAD_GL_ARM_shader_framebuffer_fetch;
+@@ -177,7 +182,12 @@ void Driver::CheckExtensionSupport() {
+     nv_fragment_shader_interlock = GLAD_GL_NV_fragment_shader_interlock;
+     intel_fragment_shader_ordering = GLAD_GL_INTEL_fragment_shader_ordering;
+     blend_minmax_factor = GLAD_GL_AMD_blend_minmax_factor || GLAD_GL_NV_blend_minmax_factor;
++#ifdef __EMSCRIPTEN__
++    // WebGL2 exposes OpenGL ES 3.0.
++    is_suitable = GLAD_GL_ES_VERSION_3_0 || GLAD_GL_ES_VERSION_3_2 || GLAD_GL_VERSION_4_3;
++#else
+     is_suitable = GLAD_GL_VERSION_4_3 || GLAD_GL_ES_VERSION_3_2;
++#endif
+ }
+ 
+ void Driver::FindBugs() {
+diff --git a/src/video_core/renderer_opengl/gl_rasterizer.cpp b/src/video_core/renderer_opengl/gl_rasterizer.cpp
+index 4cc7777..dbd4481 100644
+--- a/src/video_core/renderer_opengl/gl_rasterizer.cpp
++++ b/src/video_core/renderer_opengl/gl_rasterizer.cpp
+@@ -30,9 +30,18 @@ using VideoCore::SurfaceType;
+ using namespace Common::Literals;
+ using namespace Pica::Shader::Generator;
+ 
++#ifdef __EMSCRIPTEN__
++// GAEMBOY web: ANGLE (Metal/D3D) may copy the whole buffer when glBufferSubData targets a buffer
++// still in use by the GPU, so multi-MiB stream buffers turn every upload into a huge memcpy in the
++// browser GPU process. Small buffers keep those copies cheap and orphan (glBufferData) more often.
++constexpr std::size_t VERTEX_BUFFER_SIZE = 2_MiB;
++constexpr std::size_t INDEX_BUFFER_SIZE = 256_KiB;
++constexpr std::size_t UNIFORM_BUFFER_SIZE = 256_KiB;
++#else
+ constexpr std::size_t VERTEX_BUFFER_SIZE = 16_MiB;
+ constexpr std::size_t INDEX_BUFFER_SIZE = 2_MiB;
+ constexpr std::size_t UNIFORM_BUFFER_SIZE = 8_MiB;
++#endif
+ constexpr std::size_t TEXTURE_BUFFER_SIZE = 2_MiB;
+ 
+ GLenum MakePrimitiveMode(Pica::PipelineRegs::TriangleTopology topology) {
+@@ -67,6 +76,11 @@ GLenum MakeAttributeType(Pica::PipelineRegs::VertexAttributeFormat format) {
+ [[nodiscard]] GLsizeiptr TextureBufferSize(const Driver& driver, bool is_lf) {
+     // Use the smallest texel size from the texel views
+     // which corresponds to GL_RG32F
++#ifdef __EMSCRIPTEN__
++    (void)driver;
++    (void)is_lf;
++    return static_cast<GLsizeiptr>(1024) * 64 * sizeof(Common::Vec2f);
++#endif
+     GLint max_texel_buffer_size;
+     glGetIntegerv(GL_MAX_TEXTURE_BUFFER_SIZE, &max_texel_buffer_size);
+     GLsizeiptr candidate = std::min<GLsizeiptr>(max_texel_buffer_size * 8ULL, TEXTURE_BUFFER_SIZE);
+@@ -90,8 +104,14 @@ RasterizerOpenGL::RasterizerOpenGL(Memory::MemorySystem& memory, Pica::PicaCore&
+       vertex_buffer{driver, GL_ARRAY_BUFFER, VERTEX_BUFFER_SIZE},
+       uniform_buffer{driver, GL_UNIFORM_BUFFER, UNIFORM_BUFFER_SIZE},
+       index_buffer{driver, GL_ELEMENT_ARRAY_BUFFER, INDEX_BUFFER_SIZE},
++#ifdef __EMSCRIPTEN__
++      // GL_NONE = CPU-only staging: the LUT data reaches the GPU through glTexSubImage2D.
++      texture_buffer{driver, GL_NONE, TextureBufferSize(driver, false)},
++      texture_lf_buffer{driver, GL_NONE, TextureBufferSize(driver, true)} {
++#else
+       texture_buffer{driver, GL_TEXTURE_BUFFER, TextureBufferSize(driver, false)},
+       texture_lf_buffer{driver, GL_TEXTURE_BUFFER, TextureBufferSize(driver, true)} {
++#endif
+ 
+     // Clipping plane 0 is always enabled for PICA fixed clip plane z <= 0
+     state.clip_distance[0] = true;
+@@ -151,12 +171,26 @@ RasterizerOpenGL::RasterizerOpenGL(Memory::MemorySystem& memory, Pica::PicaCore&
+     state.texture_buffer_lut_rg.texture_buffer = texture_buffer_lut_rg.handle;
+     state.texture_buffer_lut_rgba.texture_buffer = texture_buffer_lut_rgba.handle;
+     state.Apply();
++#ifdef __EMSCRIPTEN__
++    auto init_lut_2d = [](GLenum unit, GLenum internal_format, GLsizei width, GLsizei height) {
++        glActiveTexture(unit);
++        glTexStorage2D(GL_TEXTURE_2D, 1, internal_format, width, height);
++        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
++        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
++        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
++        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
++    };
++    init_lut_2d(TextureUnits::TextureBufferLUT_LF.Enum(), GL_RG32F, 1024, 64);
++    init_lut_2d(TextureUnits::TextureBufferLUT_RG.Enum(), GL_RG32F, 1024, 64);
++    init_lut_2d(TextureUnits::TextureBufferLUT_RGBA.Enum(), GL_RGBA32F, 1024, 32);
++#else
+     glActiveTexture(TextureUnits::TextureBufferLUT_LF.Enum());
+     glTexBuffer(GL_TEXTURE_BUFFER, GL_RG32F, texture_lf_buffer.GetHandle());
+     glActiveTexture(TextureUnits::TextureBufferLUT_RG.Enum());
+     glTexBuffer(GL_TEXTURE_BUFFER, GL_RG32F, texture_buffer.GetHandle());
+     glActiveTexture(TextureUnits::TextureBufferLUT_RGBA.Enum());
+     glTexBuffer(GL_TEXTURE_BUFFER, GL_RGBA32F, texture_buffer.GetHandle());
++#endif
+ 
+     // Bind index buffer for hardware shader path
+     state.draw.vertex_array = hw_vao.handle;
+@@ -165,9 +199,11 @@ RasterizerOpenGL::RasterizerOpenGL(Memory::MemorySystem& memory, Pica::PicaCore&
+ 
+     glEnable(GL_BLEND);
+ 
++#ifndef __EMSCRIPTEN__
+     glEnable(GL_MULTISAMPLE);
+     glEnable(GL_SAMPLE_SHADING);
+     glMinSampleShading(1.0f);
++#endif
+ }
+ 
+ RasterizerOpenGL::~RasterizerOpenGL() = default;
+@@ -517,7 +553,10 @@ bool RasterizerOpenGL::AccelerateDrawBatchInternal(bool is_indexed) {
+                      vertex_array_info.vs_input_index_max);
+     vertex_buffer.Unmap(vertex_array_info.vs_input_size);
+ 
+-    curr_shader_manager->ApplyTo(state, accurate_mul);
++    if (!curr_shader_manager->ApplyTo(state, accurate_mul, regs.pipeline.num_vertices <= 6)) {
++        // Program still compiling in the background: drop this draw instead of stalling.
++        return true;
++    }
+     state.Apply();
+ 
+     if (is_indexed) {
+@@ -533,6 +572,28 @@ bool RasterizerOpenGL::AccelerateDrawBatchInternal(bool is_indexed) {
+             memory.GetPhysicalPointer(regs.pipeline.vertex_attributes.GetPhysicalBaseAddress() +
+                                       regs.pipeline.index_array.offset);
+         std::tie(buffer_ptr, buffer_offset, std::ignore) = index_buffer.Map(index_buffer_size, 4);
++#ifdef __EMSCRIPTEN__
++        const u32 min_idx = vertex_array_info.vs_input_index_min;
++        if (min_idx == 0) {
++            std::memcpy(buffer_ptr, index_data, index_buffer_size);
++        } else if (index_u16) {
++            const auto* src = reinterpret_cast<const u16*>(index_data);
++            auto* dst = reinterpret_cast<u16*>(buffer_ptr);
++            for (u32 i = 0; i < regs.pipeline.num_vertices; i++) {
++                dst[i] = static_cast<u16>(src[i] - min_idx);
++            }
++        } else {
++            for (u32 i = 0; i < regs.pipeline.num_vertices; i++) {
++                buffer_ptr[i] = static_cast<u8>(index_data[i] - min_idx);
++            }
++        }
++        index_buffer.Unmap(index_buffer_size);
++
++        glDrawRangeElements(primitive_mode, 0, vertex_array_info.vs_input_index_max - min_idx,
++                            regs.pipeline.num_vertices,
++                            index_u16 ? GL_UNSIGNED_SHORT : GL_UNSIGNED_BYTE,
++                            reinterpret_cast<const void*>(buffer_offset));
++#else
+         std::memcpy(buffer_ptr, index_data, index_buffer_size);
+         index_buffer.Unmap(index_buffer_size);
+ 
+@@ -542,6 +603,7 @@ bool RasterizerOpenGL::AccelerateDrawBatchInternal(bool is_indexed) {
+                                       index_u16 ? GL_UNSIGNED_SHORT : GL_UNSIGNED_BYTE,
+                                       reinterpret_cast<const void*>(buffer_offset),
+                                       -static_cast<GLint>(vertex_array_info.vs_input_index_min));
++#endif
+     } else {
+         glDrawArrays(primitive_mode, 0, regs.pipeline.num_vertices);
+     }
+@@ -648,11 +710,12 @@ bool RasterizerOpenGL::Draw(bool accelerate, bool is_indexed) {
+         state.draw.vertex_buffer = vertex_buffer.GetHandle();
+         curr_shader_manager->UseTrivialVertexShader();
+         curr_shader_manager->UseTrivialGeometryShader();
+-        curr_shader_manager->ApplyTo(state, accurate_mul);
++        const bool program_ready =
++            curr_shader_manager->ApplyTo(state, accurate_mul, vertex_batch.size() <= 6);
+         state.Apply();
+ 
+         std::size_t max_vertices = 3 * (VERTEX_BUFFER_SIZE / (3 * sizeof(HardwareVertex)));
+-        for (std::size_t base_vertex = 0; base_vertex < vertex_batch.size();
++        for (std::size_t base_vertex = 0; program_ready && base_vertex < vertex_batch.size();
+              base_vertex += max_vertices) {
+             const std::size_t vertices = std::min(max_vertices, vertex_batch.size() - base_vertex);
+             const std::size_t vertex_size = vertices * sizeof(HardwareVertex);
+@@ -931,9 +994,14 @@ void RasterizerOpenGL::SyncAndUploadLUTsLF() {
+     }
+ 
+     std::size_t bytes_used = 0;
++#ifdef __EMSCRIPTEN__
++    constexpr std::size_t row_bytes = 1024 * sizeof(Common::Vec2f);
++    const auto [buffer, offset, invalidate] = texture_lf_buffer.Map(max_size, row_bytes);
++#else
+     glBindBuffer(GL_TEXTURE_BUFFER, texture_lf_buffer.GetHandle());
+     const auto [buffer, offset, invalidate] =
+         texture_lf_buffer.Map(max_size, sizeof(Common::Vec4f));
++#endif
+ 
+     if (invalidate) {
+         pica.lighting.lut_dirty = pica.lighting.LutAllDirty;
+@@ -968,7 +1036,19 @@ void RasterizerOpenGL::SyncAndUploadLUTsLF() {
+         pica.fog.lut_dirty = false;
+     }
+ 
++#ifdef __EMSCRIPTEN__
++    if (bytes_used > 0) {
++        const GLint y = static_cast<GLint>(offset / row_bytes);
++        const GLsizei rows = static_cast<GLsizei>((bytes_used + row_bytes - 1) / row_bytes);
++        glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
++        glActiveTexture(TextureUnits::TextureBufferLUT_LF.Enum());
++        glBindTexture(GL_TEXTURE_2D, texture_buffer_lut_lf.handle);
++        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, y, 1024, rows, GL_RG, GL_FLOAT, buffer);
++    }
+     texture_lf_buffer.Unmap(bytes_used);
++#else
++    texture_lf_buffer.Unmap(bytes_used);
++#endif
+ }
+ 
+ void RasterizerOpenGL::SyncAndUploadLUTs() {
+@@ -982,8 +1062,13 @@ void RasterizerOpenGL::SyncAndUploadLUTs() {
+     }
+ 
+     std::size_t bytes_used = 0;
++#ifdef __EMSCRIPTEN__
++    constexpr std::size_t row_bytes = 1024 * sizeof(Common::Vec4f);
++    const auto [buffer, offset, invalidate] = texture_buffer.Map(max_size, row_bytes);
++#else
+     glBindBuffer(GL_TEXTURE_BUFFER, texture_buffer.GetHandle());
+     const auto [buffer, offset, invalidate] = texture_buffer.Map(max_size, sizeof(Common::Vec4f));
++#endif
+ 
+     if (invalidate) {
+         pica.proctex.table_dirty = pica.proctex.TableAllDirty;
+@@ -1041,7 +1126,25 @@ void RasterizerOpenGL::SyncAndUploadLUTs() {
+ 
+     pica.proctex.table_dirty = 0;
+ 
++#ifdef __EMSCRIPTEN__
++    if (bytes_used > 0) {
++        const GLint y_rgba = static_cast<GLint>(offset / row_bytes);
++        const GLint y_rg = y_rgba * 2;
++        const GLsizei rows_rg = static_cast<GLsizei>(
++            (bytes_used + 1024 * sizeof(Common::Vec2f) - 1) / (1024 * sizeof(Common::Vec2f)));
++        const GLsizei rows_rgba = static_cast<GLsizei>((bytes_used + row_bytes - 1) / row_bytes);
++        glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
++        glActiveTexture(TextureUnits::TextureBufferLUT_RG.Enum());
++        glBindTexture(GL_TEXTURE_2D, texture_buffer_lut_rg.handle);
++        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, y_rg, 1024, rows_rg, GL_RG, GL_FLOAT, buffer);
++        glActiveTexture(TextureUnits::TextureBufferLUT_RGBA.Enum());
++        glBindTexture(GL_TEXTURE_2D, texture_buffer_lut_rgba.handle);
++        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, y_rgba, 1024, rows_rgba, GL_RGBA, GL_FLOAT, buffer);
++    }
++    texture_buffer.Unmap(bytes_used);
++#else
+     texture_buffer.Unmap(bytes_used);
++#endif
+ }
+ 
+ void RasterizerOpenGL::UploadUniforms(bool accelerate_draw) {
+diff --git a/src/video_core/renderer_opengl/gl_shader_disk_cache.cpp b/src/video_core/renderer_opengl/gl_shader_disk_cache.cpp
+index 3dae1fd..c2ac2af 100644
+--- a/src/video_core/renderer_opengl/gl_shader_disk_cache.cpp
++++ b/src/video_core/renderer_opengl/gl_shader_disk_cache.cpp
+@@ -395,6 +395,9 @@ void ShaderDiskCache::SaveDecompiled(u64 unique_identifier, const std::string& c
+ }
+ 
+ void ShaderDiskCache::SaveDump(u64 unique_identifier, GLuint program) {
++#ifdef __EMSCRIPTEN__
++    return;
++#endif
+     if (!IsUsable())
+         return;
+ 
+@@ -418,6 +421,9 @@ void ShaderDiskCache::SaveDump(u64 unique_identifier, GLuint program) {
+ }
+ 
+ void ShaderDiskCache::SaveDumpToFile(u64 unique_identifier, GLuint program, bool sanitize_mul) {
++#ifdef __EMSCRIPTEN__
++    return;
++#endif
+     if (!IsUsable())
+         return;
+ 
+diff --git a/src/video_core/renderer_opengl/gl_shader_manager.cpp b/src/video_core/renderer_opengl/gl_shader_manager.cpp
+index 411b762..ef4159c 100644
+--- a/src/video_core/renderer_opengl/gl_shader_manager.cpp
++++ b/src/video_core/renderer_opengl/gl_shader_manager.cpp
+@@ -8,7 +8,9 @@
+ #include <span>
+ #include <thread>
+ #include <unordered_map>
++#include <unordered_set>
+ #include <variant>
++#include <fmt/format.h>
+ #include "common/hash.h"
+ #include "common/settings.h"
+ #include "core/frontend/emu_window.h"
+@@ -17,6 +19,7 @@
+ #include "video_core/renderer_opengl/gl_resource_manager.h"
+ #include "video_core/renderer_opengl/gl_shader_disk_cache.h"
+ #include "video_core/renderer_opengl/gl_shader_manager.h"
++#include "video_core/renderer_opengl/gl_shader_util.h"
+ #include "video_core/renderer_opengl/gl_state.h"
+ #include "video_core/shader/generator/glsl_fs_shader_gen.h"
+ #include "video_core/shader/generator/glsl_shader_gen.h"
+@@ -69,6 +72,9 @@ static OGLProgram GeneratePrecompiledProgram(const ShaderDiskCacheDump& dump,
+ }
+ 
+ static std::set<GLenum> GetSupportedFormats() {
++#ifdef __EMSCRIPTEN__
++    return {};
++#endif
+     std::set<GLenum> supported_formats;
+ 
+     GLint num_formats{};
+@@ -326,6 +332,9 @@ public:
+ 
+     FragmentShaders fragment_shaders;
+     std::unordered_map<u64, OGLProgram> program_cache;
++#ifdef __EMSCRIPTEN__
++    std::unordered_set<GLuint> pending_programs;
++#endif
+     OGLPipeline pipeline;
+     ShaderDiskCache disk_cache;
+ 
+@@ -335,7 +344,12 @@ public:
+ 
+         // Enable the geometry-shader only if we are actually doing per-fragment lighting
+         // and care about proper quaternions. Otherwise just use standard vertex+fragment shaders.
++#ifdef __EMSCRIPTEN__
++        const bool use_geometry_shader = false;
++        (void)config;
++#else
+         const bool use_geometry_shader = !config.state.lighting_disable;
++#endif
+ 
+         res.use_clip_planes = profile.has_clip_planes;
+         res.use_geometry_shader = use_geometry_shader;
+@@ -396,9 +410,16 @@ void ShaderProgramManager::UseFixedGeometryShader(const Pica::RegsInternal& regs
+         .separable_shader = impl->separable,
+     };
+ 
++#ifdef __EMSCRIPTEN__
++    impl->current.gs = 0;
++    impl->current.gs_hash = 0;
++    (void)gs_config;
++    (void)extra;
++#else
+     auto [hash, handle, _] = impl->fixed_geometry_shaders.Get(gs_config, extra);
+     impl->current.gs = handle;
+     impl->current.gs_hash = hash;
++#endif
+ }
+ 
+ void ShaderProgramManager::UseTrivialGeometryShader() {
+@@ -422,7 +443,7 @@ void ShaderProgramManager::UseFragmentShader(const Pica::RegsInternal& regs,
+     }
+ }
+ 
+-void ShaderProgramManager::ApplyTo(OpenGLState& state, bool accurate_mul) {
++bool ShaderProgramManager::ApplyTo(OpenGLState& state, bool accurate_mul, bool wait_built) {
+     if (impl->separable) {
+         if (driver.HasBug(DriverBug::ShaderStageChangeFreeze)) {
+             glUseProgramStages(
+@@ -438,6 +459,27 @@ void ShaderProgramManager::ApplyTo(OpenGLState& state, bool accurate_mul) {
+     } else {
+         const u64 unique_identifier = impl->current.GetConfigHash();
+         OGLProgram& cached_program = impl->program_cache[unique_identifier];
++#ifdef __EMSCRIPTEN__
++        if (g_web_shader_mode == 1) {
++            // Link in the background (KHR_parallel_shader_compile) and skip draws until it is
++            // ready, like the Vulkan async shader path, instead of stalling the frame.
++            if (cached_program.handle == 0) {
++                cached_program.handle = LoadProgramDeferred(
++                    std::array{impl->current.vs, impl->current.gs, impl->current.fs});
++                impl->pending_programs.insert(cached_program.handle);
++            }
++            if (impl->pending_programs.contains(cached_program.handle)) {
++                if (!wait_built && !IsProgramLinkDone(cached_program.handle)) {
++                    return false;
++                }
++                FinalizeProgram(cached_program.handle,
++                                fmt::format("{:016x}", unique_identifier));
++                impl->pending_programs.erase(cached_program.handle);
++            }
++            state.draw.shader_program = cached_program.handle;
++            return true;
++        }
++#endif
+         if (cached_program.handle == 0) {
+             cached_program.Create(false,
+                                   std::array{impl->current.vs, impl->current.gs, impl->current.fs});
+@@ -446,6 +488,7 @@ void ShaderProgramManager::ApplyTo(OpenGLState& state, bool accurate_mul) {
+         }
+         state.draw.shader_program = cached_program.handle;
+     }
++    return true;
+ }
+ 
+ u64 ShaderProgramManager::GetProgramID() const {
+@@ -598,6 +641,9 @@ void ShaderProgramManager::LoadDiskCache(const std::atomic_bool& stop_loading,
+     if (compilation_failed) {
+         // Invalidate the precompiled cache if a shader dumped shader was rejected
+         impl->program_cache.clear();
++#ifdef __EMSCRIPTEN__
++        impl->pending_programs.clear();
++#endif
+         disk_cache.InvalidatePrecompiled();
+         dumps.clear();
+         precompiled_cache_altered = true;
+diff --git a/src/video_core/renderer_opengl/gl_shader_manager.h b/src/video_core/renderer_opengl/gl_shader_manager.h
+index 024e6c8..253f1f8 100644
+--- a/src/video_core/renderer_opengl/gl_shader_manager.h
++++ b/src/video_core/renderer_opengl/gl_shader_manager.h
+@@ -52,7 +52,9 @@ public:
+ 
+     void UseFragmentShader(const Pica::RegsInternal& config, const Pica::Shader::UserConfig& user);
+ 
+-    void ApplyTo(OpenGLState& state, bool accurate_mul);
++    /// Binds the current program. Returns false when the program is still being built
++    /// asynchronously and wait_built is false; the caller should skip the draw.
++    bool ApplyTo(OpenGLState& state, bool accurate_mul, bool wait_built = true);
+ 
+     u64 GetProgramID() const;
+ 
+diff --git a/src/video_core/renderer_opengl/gl_shader_util.cpp b/src/video_core/renderer_opengl/gl_shader_util.cpp
+index 8f02213..49882e0 100644
+--- a/src/video_core/renderer_opengl/gl_shader_util.cpp
++++ b/src/video_core/renderer_opengl/gl_shader_util.cpp
+@@ -2,10 +2,14 @@
+ // Licensed under GPLv2 or any later version
+ // Refer to the misc/licenses/gplv2.txt file included.
+ 
++#include <algorithm>
+ #include <array>
+ #include <string>
+ #include <vector>
+ #include <glad/glad.h>
++#ifdef __EMSCRIPTEN__
++#include <emscripten/html5.h>
++#endif
+ #include "common/assert.h"
+ #include "common/logging/log.h"
+ #include "video_core/renderer_opengl/gl_shader_util.h"
+@@ -13,7 +17,199 @@
+ 
+ namespace OpenGL {
+ 
++#ifdef __EMSCRIPTEN__
++// 1 = async (KHR_parallel_shader_compile, no blocking status queries), 0 = classic sync path.
++int g_web_shader_mode = 1;
++
++namespace {
++constexpr GLenum GL_COMPLETION_STATUS_KHR = 0x91B1;
++
++void LogAttachedShaderErrors(GLuint program_id, const std::string& debug_name) {
++    std::array<GLuint, 4> attached{};
++    GLsizei count = 0;
++    glGetAttachedShaders(program_id, static_cast<GLsizei>(attached.size()), &count,
++                         attached.data());
++    for (GLsizei i = 0; i < count; i++) {
++        GLint length = 0;
++        glGetShaderiv(attached[i], GL_INFO_LOG_LENGTH, &length);
++        if (length > 1) {
++            std::vector<char> log(length);
++            glGetShaderInfoLog(attached[i], length, nullptr, log.data());
++            LOG_ERROR(Render_OpenGL, "Shader log for program {}:\n{}", debug_name, log.data());
++        }
++    }
++}
++
++// GLSL ES 3.00 has no layout(binding = N), so bind UBOs and samplers explicitly once.
++void BindWebProgramResources(GLuint program_id) {
++    static constexpr std::array<std::pair<const char*, GLuint>, 3> ubo_bindings{{
++        {"vs_pica_data", 0},
++        {"vs_data", 1},
++        {"fs_data", 2},
++    }};
++    for (const auto& [name, binding] : ubo_bindings) {
++        const GLuint idx = glGetUniformBlockIndex(program_id, name);
++        if (idx != GL_INVALID_INDEX) {
++            glUniformBlockBinding(program_id, idx, binding);
++        }
++    }
++    static constexpr std::array<std::pair<const char*, GLint>, 18> sampler_bindings{{
++        {"tex0", 0},
++        {"tex1", 1},
++        {"tex2", 2},
++        {"texture_buffer_lut_lf", 3},
++        {"texture_buffer_lut_rg", 4},
++        {"texture_buffer_lut_rgba", 5},
++        {"tex_normal", 6},
++        {"tex_color", 7},
++        {"color_texture", 0},
++        {"color_texture_r", 1},
++        {"depth", 0},
++        {"stencil", 1},
++        {"source", 0},
++        {"input_texture", 0},
++        {"tex", 0},
++        {"tex_input", 0},
++        {"HOOKED", 0},
++        {"LUMAD", 1},
++    }};
++    GLint prev_program = 0;
++    glGetIntegerv(GL_CURRENT_PROGRAM, &prev_program);
++    glUseProgram(program_id);
++    for (const auto& [name, unit] : sampler_bindings) {
++        const GLint loc = glGetUniformLocation(program_id, name);
++        if (loc != -1) {
++            glUniform1i(loc, unit);
++        }
++    }
++    glUseProgram(static_cast<GLuint>(prev_program));
++}
++} // Anonymous namespace
++
++GLuint LoadProgramDeferred(std::span<const GLuint> shaders) {
++    const GLuint program_id = glCreateProgram();
++    for (GLuint shader : shaders) {
++        if (shader != 0) {
++            glAttachShader(program_id, shader);
++        }
++    }
++    glLinkProgram(program_id);
++    return program_id;
++}
++
++bool HasParallelShaderCompile() {
++    static const bool supported = emscripten_webgl_enable_extension(
++        emscripten_webgl_get_current_context(), "KHR_parallel_shader_compile");
++    return supported;
++}
++
++bool IsProgramLinkDone(GLuint program_id) {
++    if (!HasParallelShaderCompile()) {
++        return true;
++    }
++    GLint done = GL_TRUE;
++    glGetProgramiv(program_id, GL_COMPLETION_STATUS_KHR, &done);
++    return done != GL_FALSE;
++}
++
++bool FinalizeProgram(GLuint program_id, const std::string& debug_name) {
++    GLint result = GL_FALSE;
++    glGetProgramiv(program_id, GL_LINK_STATUS, &result);
++    if (result != GL_TRUE) {
++        GLint length = 0;
++        glGetProgramiv(program_id, GL_INFO_LOG_LENGTH, &length);
++        std::vector<char> log(std::max<GLint>(length, 1));
++        glGetProgramInfoLog(program_id, length, nullptr, log.data());
++        LOG_ERROR(Render_OpenGL, "Error linking shader {}:\n{}", debug_name, log.data());
++        LogAttachedShaderErrors(program_id, debug_name);
++        return false;
++    }
++    BindWebProgramResources(program_id);
++    return true;
++}
++#endif
++
+ GLuint LoadShader(std::string_view source, GLenum type, const std::string& debug_name) {
++#ifdef __EMSCRIPTEN__
++    if (type == GL_GEOMETRY_SHADER) {
++        return 0;
++    }
++    std::string preamble = "#version 300 es\n#define fma(a, b, c) ((a) * (b) + (c))\n";
++    if (type == GL_FRAGMENT_SHADER) {
++        preamble += "precision highp float;\nprecision highp int;\n";
++    }
++    // Fast single-pass GLSL 320/430 -> GLSL ES 3.00 rewrite (avoids slow std::regex).
++    std::string adapted;
++    adapted.reserve(source.size());
++    auto erase_block = [](std::string& str, std::string_view marker) {
++        std::size_t pos = 0;
++        while ((pos = str.find(marker, pos)) != std::string::npos) {
++            std::size_t end = str.find('}', pos);
++            if (end == std::string::npos) break;
++            end = str.find(';', end);
++            str.erase(pos, end == std::string::npos ? str.size() - pos : end - pos + 1);
++        }
++    };
++    auto replace_all = [](std::string& str, std::string_view from, std::string_view to) {
++        std::size_t pos = 0;
++        while ((pos = str.find(from, pos)) != std::string::npos) {
++            str.replace(pos, from.size(), to);
++            pos += to.size();
++        }
++    };
++    adapted.assign(source);
++    replace_all(adapted, "#extension GL_ARB_separate_shader_objects : enable\n", "");
++    replace_all(adapted, "#extension GL_ARB_separate_shader_objects : enable", "");
++    replace_all(adapted, "precision highp samplerBuffer;", "");
++    replace_all(adapted, "precision mediump samplerBuffer;", "");
++    replace_all(adapted, "precision lowp samplerBuffer;", "");
++    replace_all(adapted, "precision highp uimage2D;", "");
++    replace_all(adapted, "precision mediump uimage2D;", "");
++    replace_all(adapted, "precision lowp uimage2D;", "");
++    erase_block(adapted, "out gl_PerVertex");
++    // Strip `layout(...)` qualifiers that are invalid in GLSL ES 3.00:
++    // - `binding = N` on samplers/UBOs
++    // - `location = N` on `uniform`, VS `out`, FS `in`
++    std::size_t pos = 0;
++    while ((pos = adapted.find("layout", pos)) != std::string::npos) {
++        std::size_t lp = pos + 6;
++        while (lp < adapted.size() && (adapted[lp] == ' ' || adapted[lp] == '\t')) lp++;
++        if (lp >= adapted.size() || adapted[lp] != '(') { pos += 6; continue; }
++        std::size_t rp = adapted.find(')', lp);
++        if (rp == std::string::npos) break;
++        std::string inner = adapted.substr(lp + 1, rp - lp - 1);
++        const bool has_binding = inner.find("binding") != std::string::npos;
++        const bool has_std140 = inner.find("std140") != std::string::npos;
++        const bool has_location = inner.find("location") != std::string::npos;
++        if (has_binding && has_std140) {
++            adapted.replace(pos, rp - pos + 1, "layout(std140)");
++            pos += 14;
++            continue;
++        }
++        if (has_binding && !has_location) {
++            std::size_t end = rp + 1;
++            while (end < adapted.size() && (adapted[end] == ' ' || adapted[end] == '\t')) end++;
++            adapted.erase(pos, end - pos);
++            continue;
++        }
++        if (has_location) {
++            std::size_t after = rp + 1;
++            while (after < adapted.size() && (adapted[after] == ' ' || adapted[after] == '\t')) after++;
++            const bool is_uniform = adapted.compare(after, 7, "uniform") == 0;
++            const bool is_vs_out = type == GL_VERTEX_SHADER && adapted.compare(after, 3, "out") == 0;
++            const bool is_fs_in = type == GL_FRAGMENT_SHADER && adapted.compare(after, 2, "in") == 0;
++            if (is_uniform || is_vs_out || is_fs_in) {
++                adapted.erase(pos, after - pos);
++                continue;
++            }
++        }
++        pos = rp + 1;
++    }
++    if (type == GL_VERTEX_SHADER && adapted.find("out vec2 texcoord;") != std::string::npos) {
++        replace_all(adapted, "texcoord", "tex_coord");
++    }
++    source = adapted;
++#else
+     std::string preamble;
+     if (GLES) {
+         preamble = R"(#version 320 es
+@@ -29,6 +225,7 @@ GLuint LoadShader(std::string_view source, GLenum type, const std::string& debug
+     } else {
+         preamble = "#version 430 core\n";
+     }
++#endif
+ 
+     std::string_view debug_type;
+     switch (type) {
+@@ -59,6 +256,13 @@ GLuint LoadShader(std::string_view source, GLenum type, const std::string& debug
+     glShaderSource(shader_id, static_cast<GLsizei>(src_arr.size()), src_arr.data(), lengths.data());
+     LOG_DEBUG(Render_OpenGL, "Compiling {} shader {}...", debug_type, debug_name);
+     glCompileShader(shader_id);
++#ifdef __EMSCRIPTEN__
++    // Querying the compile status would block until the driver finishes; link errors are
++    // reported (with the shader logs) when the program is finalized instead.
++    if (g_web_shader_mode == 1) {
++        return shader_id;
++    }
++#endif
+ 
+     GLint result = GL_FALSE;
+     GLint info_log_length;
+@@ -96,11 +300,15 @@ GLuint LoadProgram(bool separable_program, std::span<const GLuint> shaders,
+         }
+     }
+ 
++#ifndef __EMSCRIPTEN__
+     if (separable_program) {
+         glProgramParameteri(program_id, GL_PROGRAM_SEPARABLE, GL_TRUE);
+     }
+ 
+     glProgramParameteri(program_id, GL_PROGRAM_BINARY_RETRIEVABLE_HINT, GL_TRUE);
++#else
++    (void)separable_program;
++#endif
+     glLinkProgram(program_id);
+ 
+     // Check the program
+@@ -122,6 +330,14 @@ GLuint LoadProgram(bool separable_program, std::span<const GLuint> shaders,
+         LOG_ERROR(Render_OpenGL, "Error linking shader {}: No log produced.", debug_name);
+     }
+ 
++#ifdef __EMSCRIPTEN__
++    if (result == GL_TRUE) {
++        BindWebProgramResources(program_id);
++    } else {
++        LogAttachedShaderErrors(program_id, debug_name);
++    }
++#endif
++
+     for (GLuint shader : shaders) {
+         if (shader != 0) {
+             glDetachShader(program_id, shader);
+diff --git a/src/video_core/renderer_opengl/gl_shader_util.h b/src/video_core/renderer_opengl/gl_shader_util.h
+index ee67b93..d926059 100644
+--- a/src/video_core/renderer_opengl/gl_shader_util.h
++++ b/src/video_core/renderer_opengl/gl_shader_util.h
+@@ -5,6 +5,8 @@
+ #pragma once
+ 
+ #include <span>
++#include <string>
++#include <string_view>
+ #include <glad/glad.h>
+ 
+ namespace OpenGL {
+@@ -27,4 +29,21 @@ GLuint LoadShader(std::string_view source, GLenum type, const std::string& debug
+ GLuint LoadProgram(bool separable_program, std::span<const GLuint> shaders,
+                    const std::string& debug_name);
+ 
++#ifdef __EMSCRIPTEN__
++/// 1 = asynchronous shader compilation (default on web), 0 = synchronous.
++extern int g_web_shader_mode;
++
++/// Starts linking a program without any blocking status query (KHR_parallel_shader_compile).
++GLuint LoadProgramDeferred(std::span<const GLuint> shaders);
++
++/// Whether the context exposes KHR_parallel_shader_compile (enables it on first call).
++bool HasParallelShaderCompile();
++
++/// Non-blocking check whether a deferred link has finished.
++bool IsProgramLinkDone(GLuint program_id);
++
++/// Checks the link status and binds UBOs/samplers. Blocks if the link is still running.
++bool FinalizeProgram(GLuint program_id, const std::string& debug_name);
++#endif
++
+ } // namespace OpenGL
+diff --git a/src/video_core/renderer_opengl/gl_state.cpp b/src/video_core/renderer_opengl/gl_state.cpp
+index 4f41499..f8124ce 100644
+--- a/src/video_core/renderer_opengl/gl_state.cpp
++++ b/src/video_core/renderer_opengl/gl_state.cpp
+@@ -172,6 +172,7 @@ void OpenGLState::Apply() const {
+             glDisable(GL_BLEND);
+         }
+ 
++#ifndef __EMSCRIPTEN__
+         // GLES does not support glLogicOp
+         if (!GLES) {
+             if (blend.enabled) {
+@@ -180,6 +181,7 @@ void OpenGLState::Apply() const {
+                 glEnable(GL_COLOR_LOGIC_OP);
+             }
+         }
++#endif
+     }
+ 
+     if (blend.color.red != cur_state.blend.color.red ||
+@@ -202,12 +204,14 @@ void OpenGLState::Apply() const {
+         glBlendEquationSeparate(blend.rgb_equation, blend.a_equation);
+     }
+ 
++#ifndef __EMSCRIPTEN__
+     // GLES does not support glLogicOp
+     if (!GLES) {
+         if (logic_op != cur_state.logic_op) {
+             glLogicOp(logic_op);
+         }
+     }
++#endif
+ 
+     // Textures
+     for (u32 i = 0; i < texture_units.size(); ++i) {
+@@ -223,20 +227,32 @@ void OpenGLState::Apply() const {
+     // Texture buffer LUTs
+     if (texture_buffer_lut_lf.texture_buffer != cur_state.texture_buffer_lut_lf.texture_buffer) {
+         glActiveTexture(TextureUnits::TextureBufferLUT_LF.Enum());
++        #ifdef __EMSCRIPTEN__
++        glBindTexture(GL_TEXTURE_2D, texture_buffer_lut_lf.texture_buffer);
++#else
+         glBindTexture(GL_TEXTURE_BUFFER, texture_buffer_lut_lf.texture_buffer);
++#endif
+     }
+ 
+     // Texture buffer LUTs
+     if (texture_buffer_lut_rg.texture_buffer != cur_state.texture_buffer_lut_rg.texture_buffer) {
+         glActiveTexture(TextureUnits::TextureBufferLUT_RG.Enum());
++        #ifdef __EMSCRIPTEN__
++        glBindTexture(GL_TEXTURE_2D, texture_buffer_lut_rg.texture_buffer);
++#else
+         glBindTexture(GL_TEXTURE_BUFFER, texture_buffer_lut_rg.texture_buffer);
++#endif
+     }
+ 
+     // Texture buffer LUTs
+     if (texture_buffer_lut_rgba.texture_buffer !=
+         cur_state.texture_buffer_lut_rgba.texture_buffer) {
+         glActiveTexture(TextureUnits::TextureBufferLUT_RGBA.Enum());
++        #ifdef __EMSCRIPTEN__
++        glBindTexture(GL_TEXTURE_2D, texture_buffer_lut_rgba.texture_buffer);
++#else
+         glBindTexture(GL_TEXTURE_BUFFER, texture_buffer_lut_rgba.texture_buffer);
++#endif
+     }
+ 
+     // Color buffer
+@@ -245,6 +261,7 @@ void OpenGLState::Apply() const {
+         glBindTexture(GL_TEXTURE_2D, color_buffer.texture_2d);
+     }
+ 
++#ifndef __EMSCRIPTEN__
+     // Shadow Images
+     if (image_shadow_buffer != cur_state.image_shadow_buffer) {
+         glBindImageTexture(ImageUnits::ShadowBuffer, image_shadow_buffer, 0, GL_FALSE, 0,
+@@ -281,6 +298,7 @@ void OpenGLState::Apply() const {
+                            GL_READ_ONLY, GL_R32UI);
+     }
+ 
++#endif
+     // Framebuffer
+     if (draw.read_framebuffer != cur_state.draw.read_framebuffer) {
+         glBindFramebuffer(GL_READ_FRAMEBUFFER, draw.read_framebuffer);
+@@ -335,6 +353,7 @@ void OpenGLState::Apply() const {
+     }
+ 
+     // Clip distance
++#ifndef __EMSCRIPTEN__
+     if (!GLES || GLAD_GL_EXT_clip_cull_distance) {
+         for (std::size_t i = 0; i < clip_distance.size(); ++i) {
+             if (clip_distance[i] != cur_state.clip_distance[i]) {
+@@ -347,6 +366,8 @@ void OpenGLState::Apply() const {
+         }
+     }
+ 
++#endif
++
+     if (renderbuffer != cur_state.renderbuffer) {
+         glBindRenderbuffer(GL_RENDERBUFFER, renderbuffer);
+     }
+diff --git a/src/video_core/renderer_opengl/gl_stream_buffer.cpp b/src/video_core/renderer_opengl/gl_stream_buffer.cpp
+index aac24a4..e466792 100644
+--- a/src/video_core/renderer_opengl/gl_stream_buffer.cpp
++++ b/src/video_core/renderer_opengl/gl_stream_buffer.cpp
+@@ -2,6 +2,7 @@
+ // Licensed under GPLv2 or any later version
+ // Refer to the misc/licenses/gplv2.txt file included.
+ 
++#include <algorithm>
+ #include "common/alignment.h"
+ #include "common/assert.h"
+ #include "common/microprofile.h"
+@@ -13,9 +14,24 @@ MICROPROFILE_DEFINE(OpenGL_StreamBuffer, "OpenGL", "Stream Buffer Orphaning",
+ 
+ namespace OpenGL {
+ 
++#ifdef __EMSCRIPTEN__
++int g_web_stream_mode = 1;
++#endif
++
+ OGLStreamBuffer::OGLStreamBuffer(Driver& driver, GLenum target, GLsizeiptr size,
+                                  bool prefer_coherent)
+     : gl_target(target), buffer_size(size) {
++#ifdef __EMSCRIPTEN__
++    if (target == GL_NONE) {
++        cpu_only = true;
++        cpu_buffer.resize(static_cast<std::size_t>(size));
++        mapped_ptr = cpu_buffer.data();
++        (void)driver;
++        (void)prefer_coherent;
++        return;
++    }
++    orphan_each_upload = g_web_stream_mode == 1;
++#endif
+     gl_buffer.Create();
+     glBindBuffer(gl_target, gl_buffer.handle);
+ 
+@@ -24,6 +40,14 @@ OGLStreamBuffer::OGLStreamBuffer(Driver& driver, GLenum target, GLsizeiptr size,
+         allocate_size *= 2;
+     }
+ 
++#ifdef __EMSCRIPTEN__
++    // WebGL2 has no glMapBufferRange/glBufferStorage: stage writes in CPU memory and upload via
++    // glBufferSubData on Unmap().
++    cpu_buffer.resize(static_cast<std::size_t>(allocate_size));
++    glBufferData(gl_target, allocate_size, nullptr, GL_STREAM_DRAW);
++    mapped_ptr = cpu_buffer.data();
++    (void)prefer_coherent;
++#else
+     if (GLAD_GL_ARB_buffer_storage) {
+         persistent = true;
+         coherent = prefer_coherent;
+@@ -35,6 +59,7 @@ OGLStreamBuffer::OGLStreamBuffer(Driver& driver, GLenum target, GLsizeiptr size,
+     } else {
+         glBufferData(gl_target, allocate_size, nullptr, GL_STREAM_DRAW);
+     }
++#endif
+ }
+ 
+ OGLStreamBuffer::~OGLStreamBuffer() {
+@@ -72,6 +97,19 @@ std::tuple<u8*, GLintptr, bool> OGLStreamBuffer::Map(GLsizeiptr size, GLintptr a
+         }
+     }
+ 
++#ifdef __EMSCRIPTEN__
++    if (orphan_each_upload) {
++        // ANGLE (Metal/D3D) copies the whole buffer when glBufferSubData hits storage the GPU is
++        // still reading, which on draw-heavy games stalls the browser GPU process. Replacing the
++        // storage on every upload (glBufferData in Unmap) never touches in-flight data.
++        buffer_pos = 0;
++        return std::make_tuple(cpu_buffer.data(), buffer_pos, true);
++    }
++    if (invalidate && !cpu_only) {
++        glBufferData(gl_target, buffer_size, nullptr, GL_STREAM_DRAW);
++    }
++    return std::make_tuple(cpu_buffer.data() + buffer_pos, buffer_pos, invalidate);
++#else
+     if (invalidate || !persistent) {
+         MICROPROFILE_SCOPE(OpenGL_StreamBuffer);
+         GLbitfield flags = GL_MAP_WRITE_BIT | (persistent ? GL_MAP_PERSISTENT_BIT : 0) |
+@@ -83,11 +121,33 @@ std::tuple<u8*, GLintptr, bool> OGLStreamBuffer::Map(GLsizeiptr size, GLintptr a
+     }
+ 
+     return std::make_tuple(mapped_ptr + buffer_pos - mapped_offset, buffer_pos, invalidate);
++#endif
+ }
+ 
+ void OGLStreamBuffer::Unmap(GLsizeiptr size) {
+     ASSERT(size <= mapped_size);
+-
++#ifdef __EMSCRIPTEN__
++    if (cpu_only) {
++        buffer_pos += size;
++        return;
++    }
++    if (orphan_each_upload) {
++        if (size > 0) {
++            // Power-of-two size buckets let the browser/ANGLE recycle allocations.
++            GLsizeiptr alloc = 1024;
++            while (alloc < size) {
++                alloc <<= 1;
++            }
++            alloc = std::min<GLsizeiptr>(alloc, static_cast<GLsizeiptr>(cpu_buffer.size()));
++            glBufferData(gl_target, alloc, cpu_buffer.data(), GL_STREAM_DRAW);
++        }
++        return;
++    }
++    if (size > 0) {
++        glBufferSubData(gl_target, buffer_pos, size, cpu_buffer.data() + buffer_pos);
++    }
++    buffer_pos += size;
++#else
+     if (!coherent && size > 0) {
+         glFlushMappedBufferRange(gl_target, buffer_pos - mapped_offset, size);
+     }
+@@ -97,6 +157,7 @@ void OGLStreamBuffer::Unmap(GLsizeiptr size) {
+     }
+ 
+     buffer_pos += size;
++#endif
+ }
+ 
+ } // namespace OpenGL
+diff --git a/src/video_core/renderer_opengl/gl_stream_buffer.h b/src/video_core/renderer_opengl/gl_stream_buffer.h
+index 8b3e29f..9594046 100644
+--- a/src/video_core/renderer_opengl/gl_stream_buffer.h
++++ b/src/video_core/renderer_opengl/gl_stream_buffer.h
+@@ -5,12 +5,19 @@
+ #pragma once
+ 
+ #include <tuple>
++#include <vector>
+ #include "video_core/renderer_opengl/gl_resource_manager.h"
+ 
+ namespace OpenGL {
+ 
+ class Driver;
+ 
++#ifdef __EMSCRIPTEN__
++// GAEMBOY web: 1 = orphan (glBufferData) on every upload, 0 = classic ring + glBufferSubData.
++// Set by the frontend before the core creates the renderer.
++extern int g_web_stream_mode;
++#endif
++
+ class OGLStreamBuffer : private NonCopyable {
+ public:
+     explicit OGLStreamBuffer(Driver& driver, GLenum target, GLsizeiptr size,
+@@ -37,6 +44,11 @@ private:
+     GLenum gl_target;
+ 
+     bool coherent = false;
++#ifdef __EMSCRIPTEN__
++    std::vector<u8> cpu_buffer;
++    bool cpu_only = false;
++    bool orphan_each_upload = false;
++#endif
+     bool persistent = false;
+ 
+     GLintptr buffer_pos = 0;
+diff --git a/src/video_core/renderer_opengl/gl_texture_runtime.cpp b/src/video_core/renderer_opengl/gl_texture_runtime.cpp
+index 5ccfe01..6519e2e 100644
+--- a/src/video_core/renderer_opengl/gl_texture_runtime.cpp
++++ b/src/video_core/renderer_opengl/gl_texture_runtime.cpp
+@@ -97,12 +97,15 @@ static constexpr std::array<FormatTuple, 8> CUSTOM_TUPLES = {{
+     OGLTexture texture{};
+     texture.Create();
+ 
++#ifndef __EMSCRIPTEN__
+     if (samples > 1) {
+         ASSERT(target == GL_TEXTURE_2D);
+         glBindTexture(GL_TEXTURE_2D_MULTISAMPLE, texture.handle);
+         glTexStorage2DMultisample(GL_TEXTURE_2D_MULTISAMPLE, samples, tuple.internal_format, width,
+                                   height, true);
+-    } else {
++    } else
++#endif
++    {
+         glBindTexture(target, texture.handle);
+         glTexStorage2D(target, levels, tuple.internal_format, width, height);
+     }
+@@ -111,9 +114,13 @@ static constexpr std::array<FormatTuple, 8> CUSTOM_TUPLES = {{
+     glTexParameteri(target, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+     glTexParameteri(target, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+ 
++#ifndef __EMSCRIPTEN__
+     if (!debug_name.empty()) {
+         glObjectLabel(GL_TEXTURE, texture.handle, debug_name.size(), debug_name.data());
+     }
++#else
++    (void)debug_name;
++#endif
+ 
+     return texture;
+ }
+@@ -314,12 +321,39 @@ bool TextureRuntime::CopyTextures(Surface& source, Surface& dest,
+     const GLenum dest_textarget =
+         dest.texture_type == VideoCore::TextureType::CubeMap ? GL_TEXTURE_CUBE_MAP : GL_TEXTURE_2D;
+ 
++#ifdef __EMSCRIPTEN__
++    const OpenGLState prev_state = OpenGLState::GetCurState();
++    const bool is_depth = source.type == VideoCore::SurfaceType::Depth ||
++                          source.type == VideoCore::SurfaceType::DepthStencil;
++    const GLenum att = source.type == VideoCore::SurfaceType::DepthStencil
++                           ? GL_DEPTH_STENCIL_ATTACHMENT
++                           : (source.type == VideoCore::SurfaceType::Depth ? GL_DEPTH_ATTACHMENT
++                                                                            : GL_COLOR_ATTACHMENT0);
++    const GLbitfield mask = source.type == VideoCore::SurfaceType::DepthStencil
++                                ? (GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT)
++                                : (is_depth ? GL_DEPTH_BUFFER_BIT : GL_COLOR_BUFFER_BIT);
++    glBindFramebuffer(GL_READ_FRAMEBUFFER, read_fbos[0].handle);
++    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, draw_fbos[0].handle);
++    for (const auto& copy : copies) {
++        glFramebufferTexture2D(GL_READ_FRAMEBUFFER, att, src_textarget, source.Handle(),
++                               copy.src_level);
++        glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, att, dest_textarget, dest.Handle(),
++                               copy.dst_level);
++        glBlitFramebuffer(copy.src_offset.x, copy.src_offset.y,
++                          copy.src_offset.x + copy.extent.width,
++                          copy.src_offset.y + copy.extent.height, copy.dst_offset.x,
++                          copy.dst_offset.y, copy.dst_offset.x + copy.extent.width,
++                          copy.dst_offset.y + copy.extent.height, mask, GL_NEAREST);
++    }
++    prev_state.Apply();
++#else
+     for (const auto& copy : copies) {
+         glCopyImageSubData(source.Handle(), src_textarget, copy.src_level, copy.src_offset.x,
+                            copy.src_offset.y, copy.src_layer, dest.Handle(), dest_textarget,
+                            copy.dst_level, copy.dst_offset.x, copy.dst_offset.y, copy.dst_layer,
+                            copy.extent.width, copy.extent.height, 1);
+     }
++#endif
+     return true;
+ }
+ 
+@@ -447,12 +481,26 @@ GLuint Surface::CopyHandle() noexcept {
+                                   tuple, DebugName(true));
+     }
+ 
++#ifdef __EMSCRIPTEN__
++    const OpenGLState prev_state = OpenGLState::GetCurState();
++    OGLFramebuffer copy_fbo; copy_fbo.Create(); glBindFramebuffer(GL_READ_FRAMEBUFFER, copy_fbo.handle);
++    for (u32 level = 0; level < levels; level++) {
++        const u32 width = GetScaledWidth() >> level;
++        const u32 height = GetScaledHeight() >> level;
++        glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D,
++                               Handle(1), level);
++        glBindTexture(GL_TEXTURE_2D, copy_texture.handle);
++        glCopyTexSubImage2D(GL_TEXTURE_2D, level, 0, 0, 0, 0, width, height);
++    }
++    prev_state.Apply();
++#else
+     for (u32 level = 0; level < levels; level++) {
+         const u32 width = GetScaledWidth() >> level;
+         const u32 height = GetScaledHeight() >> level;
+         glCopyImageSubData(Handle(1), GL_TEXTURE_2D, level, 0, 0, 0, copy_texture.handle,
+                            GL_TEXTURE_2D, level, 0, 0, 0, width, height, 1);
+     }
++#endif
+ 
+     return copy_texture.handle;
+ }
+@@ -796,7 +844,11 @@ Sampler::Sampler(TextureRuntime&, VideoCore::SamplerParams params) {
+     glSamplerParameteri(handle, GL_TEXTURE_WRAP_S, wrap_s);
+     glSamplerParameteri(handle, GL_TEXTURE_WRAP_T, wrap_t);
+ 
++#ifndef __EMSCRIPTEN__
+     glSamplerParameterfv(handle, GL_TEXTURE_BORDER_COLOR, gl_color.AsArray());
++#else
++    (void)gl_color;
++#endif
+ 
+     glSamplerParameterf(handle, GL_TEXTURE_MIN_LOD, lod_min);
+     glSamplerParameterf(handle, GL_TEXTURE_MAX_LOD, lod_max);
+@@ -817,7 +869,9 @@ DebugScope::~DebugScope() {
+     if (!Settings::values.renderer_debug) {
+         return;
+     }
++#ifndef __EMSCRIPTEN__
+     glPopDebugGroup();
++#endif
+     global_scope_depth--;
+ }
+ 
+diff --git a/src/video_core/renderer_opengl/pica_to_gl.h b/src/video_core/renderer_opengl/pica_to_gl.h
+index 3b5d86e..641ff5c 100644
+--- a/src/video_core/renderer_opengl/pica_to_gl.h
++++ b/src/video_core/renderer_opengl/pica_to_gl.h
+@@ -53,13 +53,21 @@ inline GLenum TextureMinFilterMode(TextureFilter min, TextureFilter mip) {
+ inline GLenum WrapMode(Pica::TexturingRegs::TextureConfig::WrapMode mode) {
+     static constexpr std::array<GLenum, 8> wrap_mode_table{{
+         GL_CLAMP_TO_EDGE,   // WrapMode::ClampToEdge
+-        GL_CLAMP_TO_BORDER, // WrapMode::ClampToBorder
++        #ifdef __EMSCRIPTEN__
++    GL_CLAMP_TO_EDGE,
++#else
++    GL_CLAMP_TO_BORDER,
++#endif // WrapMode::ClampToBorder
+         GL_REPEAT,          // WrapMode::Repeat
+         GL_MIRRORED_REPEAT, // WrapMode::MirroredRepeat
+         // TODO(wwylele): ClampToEdge2 and ClampToBorder2 are not properly implemented here. See the
+         // comments in enum WrapMode.
+         GL_CLAMP_TO_EDGE,   // WrapMode::ClampToEdge2
+-        GL_CLAMP_TO_BORDER, // WrapMode::ClampToBorder2
++        #ifdef __EMSCRIPTEN__
++    GL_CLAMP_TO_EDGE,
++#else
++    GL_CLAMP_TO_BORDER,
++#endif // WrapMode::ClampToBorder2
+         GL_REPEAT,          // WrapMode::Repeat2
+         GL_REPEAT,          // WrapMode::Repeat3
+     }};
+diff --git a/src/video_core/renderer_opengl/renderer_opengl.cpp b/src/video_core/renderer_opengl/renderer_opengl.cpp
+index 8244a83..9e440f5 100644
+--- a/src/video_core/renderer_opengl/renderer_opengl.cpp
++++ b/src/video_core/renderer_opengl/renderer_opengl.cpp
+@@ -158,6 +158,10 @@ void RendererOpenGL::SwapBuffers() {
+ }
+ 
+ void RendererOpenGL::LimitFramesAheadOfGpu() {
++#ifdef __EMSCRIPTEN__
++    // WebGL2 forbids GL_TIMEOUT_IGNORED in clientWaitSync; worker rAF paces frames instead.
++    return;
++#endif
+     const GLsync game_frame_fence = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
+     glFlush();
+     if (previous_game_frame_fence) {
+diff --git a/src/video_core/renderer_software/renderer_software.cpp b/src/video_core/renderer_software/renderer_software.cpp
+index 14aabca..d8d02b5 100644
+--- a/src/video_core/renderer_software/renderer_software.cpp
++++ b/src/video_core/renderer_software/renderer_software.cpp
+@@ -45,7 +45,16 @@ void RendererSoftware::LoadFBToScreenInfo(int i, const Pica::ColorFill& color_fi
+     const u8* framebuffer_data = memory.GetPhysicalPointer(framebuffer_addr);
+ 
+     const s32 pixel_stride = framebuffer.stride / bpp;
+-    info.height = framebuffer.height;
++    // 800px "wide" mode on the top screen (libctru gfxSetWide): neither the 2D (bit 6) nor the
++    // stereoscopic (bit 5) flag is set and the framebuffer holds twice as many lines. Bits 8-9
++    // are only set by a real buffer swap, which keeps the reset-time register value out of it.
++    u32 lines = framebuffer.height;
++    const bool wide =
++        fb_id == 0 && (framebuffer.format & 0x60) == 0 && (framebuffer.format & 0x300) != 0;
++    if (wide && memory.IsValidPhysicalAddress(framebuffer_addr + framebuffer.stride * lines * 2 - 1)) {
++        lines *= 2;
++    }
++    info.height = lines;
+     info.width = pixel_stride;
+     info.pixels.resize(info.width * info.height * 4);
+ 
+diff --git a/src/video_core/renderer_software/sw_rasterizer.cpp b/src/video_core/renderer_software/sw_rasterizer.cpp
+index 1e82f87..8d244c2 100644
+--- a/src/video_core/renderer_software/sw_rasterizer.cpp
++++ b/src/video_core/renderer_software/sw_rasterizer.cpp
+@@ -303,8 +303,7 @@ void RasterizerSoftware::ProcessTriangle(const Vertex& v0, const Vertex& v1, con
+ 
+     // Enter rasterization loop, starting at the center of the topleft bounding box corner.
+     // TODO: Not sure if looping through x first might be faster
+-    for (u16 y = min_y + 8; y < max_y; y += 0x10) {
+-        const auto process_scanline = [&, y] {
++    const auto process_scanline = [&](u16 y) {
+             for (u16 x = min_x + 8; x < max_x; x += 0x10) {
+                 // Do not process the pixel if it's inside the scissor box and the scissor mode is
+                 // set to Exclude.
+@@ -467,8 +466,31 @@ void RasterizerSoftware::ProcessTriangle(const Vertex& v0, const Vertex& v1, con
+                 }
+             }
+         };
+-        sw_workers.QueueWork(std::move(process_scanline));
++#ifdef __EMSCRIPTEN__
++    // WebAssembly: futex-based sync makes one job per scanline cost more than the scanline
++    // itself. Rasterize small triangles inline, split big ones into one interleaved band per
++    // worker (bands jobs + one wait per triangle instead of one job per scanline).
++    const u32 first_y = min_y + 8;
++    const u32 rows = max_y > first_y ? (max_y - first_y + 0xF) / 0x10 : 0;
++    const u32 bands = static_cast<u32>(std::min<std::size_t>(num_sw_threads, rows / 8));
++    if (bands <= 1) {
++        for (u32 y = first_y; y < max_y; y += 0x10) {
++            process_scanline(static_cast<u16>(y));
++        }
++        return;
++    }
++    for (u32 band = 0; band < bands; band++) {
++        sw_workers.QueueWork([&, band, bands, first_y] {
++            for (u32 y = first_y + band * 0x10; y < max_y; y += 0x10 * bands) {
++                process_scanline(static_cast<u16>(y));
++            }
++        });
++    }
++#else
++    for (u16 y = min_y + 8; y < max_y; y += 0x10) {
++        sw_workers.QueueWork([&, y] { process_scanline(y); });
+     }
++#endif
+     sw_workers.WaitForRequests();
+ }
+ 
+diff --git a/src/video_core/shader/generator/glsl_fs_shader_gen.cpp b/src/video_core/shader/generator/glsl_fs_shader_gen.cpp
+index 972a248..b31a52d 100644
+--- a/src/video_core/shader/generator/glsl_fs_shader_gen.cpp
++++ b/src/video_core/shader/generator/glsl_fs_shader_gen.cpp
+@@ -42,13 +42,17 @@ static constexpr char fragment_shader_precision_OES[] = R"(
+ #ifdef GL_FRAGMENT_PRECISION_HIGH
+ precision highp int;
+ precision highp float;
++#if __VERSION__ >= 310
+ precision highp samplerBuffer;
+ precision highp uimage2D;
++#endif
+ #else
+ precision mediump int;
+ precision mediump float;
++#if __VERSION__ >= 310
+ precision mediump samplerBuffer;
+ precision mediump uimage2D;
++#endif
+ #endif // GL_FRAGMENT_PRECISION_HIGH
+ #endif
+ )";
+@@ -823,7 +827,7 @@ void FragmentModule::WriteFog() {
+     // Generate clamped fog factor from LUT for given fog index
+     out += "float fog_i = clamp(floor(fog_index), 0.0, 127.0);\n"
+            "float fog_f = fog_index - fog_i;\n"
+-           "vec2 fog_lut_entry = texelFetch(texture_buffer_lut_lf, int(fog_i) + "
++           "vec2 fog_lut_entry = FetchLut(texture_buffer_lut_lf, int(fog_i) + "
+            "fog_lut_offset).rg;\n"
+            "float fog_factor = fog_lut_entry.r + fog_lut_entry.g * fog_f;\n"
+            "fog_factor = clamp(fog_factor, 0.0, 1.0);\n";
+@@ -1053,7 +1057,7 @@ float ProcTexLookupLUT(int offset, float coord) {
+     float index_i = clamp(floor(coord), 0.0, 127.0);
+     float index_f = coord - index_i; // fract() cannot be used here because 128.0 needs to be
+                                      // extracted as index_i = 127.0 and index_f = 1.0
+-    vec2 entry = texelFetch(texture_buffer_lut_rg, int(index_i) + offset).rg;
++    vec2 entry = FetchLut(texture_buffer_lut_rg, int(index_i) + offset).rg;
+     return clamp(entry.r + entry.g * index_f, 0.0, 1.0);
+ }
+     )";
+@@ -1114,16 +1118,16 @@ float ProcTexNoiseCoef(vec2 x) {
+     case ProcTexFilter::LinearMipmapNearest:
+         out += "int lut_index_i = int(lut_coord) + lut_offset;\n";
+         out += "float lut_index_f = fract(lut_coord);\n";
+-        out += "return texelFetch(texture_buffer_lut_rgba, lut_index_i + "
++        out += "return FetchLut(texture_buffer_lut_rgba, lut_index_i + "
+                "proctex_lut_offset) + "
+                "lut_index_f * "
+-               "texelFetch(texture_buffer_lut_rgba, lut_index_i + proctex_diff_lut_offset);\n";
++               "FetchLut(texture_buffer_lut_rgba, lut_index_i + proctex_diff_lut_offset);\n";
+         break;
+     case ProcTexFilter::Nearest:
+     case ProcTexFilter::NearestMipmapLinear:
+     case ProcTexFilter::NearestMipmapNearest:
+         out += "lut_coord += float(lut_offset);\n";
+-        out += "return texelFetch(texture_buffer_lut_rgba, int(round(lut_coord)) + "
++        out += "return FetchLut(texture_buffer_lut_rgba, int(round(lut_coord)) + "
+                "proctex_lut_offset);\n";
+         break;
+     }
+@@ -1332,9 +1336,16 @@ void FragmentModule::DefineBindingsVK() {
+ void FragmentModule::DefineBindingsGL() {
+     // Uniform and texture buffers
+     out += FSUniformBlockDef;
++#ifdef __EMSCRIPTEN__
++    out += "uniform sampler2D texture_buffer_lut_lf;\n";
++    out += "uniform sampler2D texture_buffer_lut_rg;\n";
++    out += "uniform sampler2D texture_buffer_lut_rgba;\n";
++    out += "vec4 FetchLut(sampler2D lut, int idx) { return texelFetch(lut, ivec2(idx & 1023, idx >> 10), 0); }\n\n";
++#else
+     out += "layout(binding = 3) uniform samplerBuffer texture_buffer_lut_lf;\n";
+     out += "layout(binding = 4) uniform samplerBuffer texture_buffer_lut_rg;\n";
+-    out += "layout(binding = 5) uniform samplerBuffer texture_buffer_lut_rgba;\n\n";
++    out += "layout(binding = 5) uniform samplerBuffer texture_buffer_lut_rgba;\n#define FetchLut texelFetch\n\n";
++#endif
+ 
+     // Texture samplers
+     const auto texture_type = config.texture.texture0_type.Value();
+@@ -1406,7 +1417,7 @@ void FragmentModule::DefineLightingHelpers() {
+ 
+     out += R"(
+ float LookupLightingLUT(int lut_index, int index, float delta) {
+-    vec2 entry = texelFetch(texture_buffer_lut_lf, lighting_lut_offset[lut_index >> 2][lut_index & 3] + index).rg;
++    vec2 entry = FetchLut(texture_buffer_lut_lf, lighting_lut_offset[lut_index >> 2][lut_index & 3] + index).rg;
+     return entry.r + entry.g * delta;
+ }
+ 
+diff --git a/src/video_core/renderer_opengl/gl_shader_manager.cpp b/src/video_core/renderer_opengl/gl_shader_manager.cpp
+index ef4159c..ed1d397 100644
+--- a/src/video_core/renderer_opengl/gl_shader_manager.cpp
++++ b/src/video_core/renderer_opengl/gl_shader_manager.cpp
+@@ -293,6 +293,9 @@ public:
+             .has_gl_nv_fragment_shader_barycentric = false,
+             .is_vulkan = false,
+         };
++#ifdef __EMSCRIPTEN__
++        LoadWebShaderProgramCache();
++#endif
+     }
+ 
+     struct ShaderTuple {
+diff --git a/src/video_core/renderer_opengl/gl_shader_util.cpp b/src/video_core/renderer_opengl/gl_shader_util.cpp
+index 49882e0..541e6cf 100644
+--- a/src/video_core/renderer_opengl/gl_shader_util.cpp
++++ b/src/video_core/renderer_opengl/gl_shader_util.cpp
+@@ -4,7 +4,12 @@
+ 
+ #include <algorithm>
+ #include <array>
++#include <cstdint>
++#include <cstdio>
++#include <fstream>
+ #include <string>
++#include <unordered_map>
++#include <unordered_set>
+ #include <vector>
+ #include <glad/glad.h>
+ #ifdef __EMSCRIPTEN__
+@@ -23,6 +28,162 @@ int g_web_shader_mode = 1;
+ 
+ namespace {
+ constexpr GLenum GL_COMPLETION_STATUS_KHR = 0x91B1;
++constexpr char WEB_SHADER_CACHE_PATH[] = "/gaemboy/3ds/saves/web-shader-cache-v1.bin";
++constexpr char WEB_SHADER_CACHE_TEMP_PATH[] = "/gaemboy/3ds/saves/web-shader-cache-v1.tmp";
++constexpr std::array<char, 8> WEB_SHADER_CACHE_MAGIC{'G', 'B', '3', 'D', 'S', 'S', 'C', '1'};
++constexpr std::size_t WEB_SHADER_CACHE_MAX_BYTES = 4 * 1024 * 1024;
++constexpr std::size_t WEB_SHADER_CACHE_MAX_ENTRIES = 256;
++constexpr std::size_t WEB_SHADER_CACHE_MAX_SOURCE_BYTES = 256 * 1024;
++constexpr std::size_t WEB_SHADER_CACHE_STARTUP_WARMUP = 24;
++constexpr std::size_t WEB_SHADER_CACHE_SYNC_WARMUP = 4;
++
++struct WebShaderSource {
++    GLenum type;
++    std::string source;
++};
++
++struct WebShaderProgramSource {
++    std::string vertex;
++    std::string fragment;
++    std::string key;
++};
++
++std::unordered_map<GLuint, WebShaderSource> web_shader_sources;
++std::unordered_map<GLuint, WebShaderProgramSource> web_pending_program_sources;
++std::unordered_map<std::string, GLuint> web_preloaded_programs;
++std::unordered_set<std::string> web_saved_programs;
++std::vector<WebShaderProgramSource> web_shader_cache_entries;
++std::size_t web_shader_cache_bytes = WEB_SHADER_CACHE_MAGIC.size();
++bool web_shader_cache_loaded = false;
++bool web_shader_cache_initialized = false;
++
++std::string MakeWebShaderProgramKey(std::string_view vertex, std::string_view fragment) {
++    std::string key;
++    const auto append = [&key](std::string_view source) {
++        const std::uint64_t length = source.size();
++        key.append(reinterpret_cast<const char*>(&length), sizeof(length));
++        key.append(source);
++    };
++    append(vertex);
++    append(fragment);
++    return key;
++}
++
++bool GetWebShaderProgramSource(std::span<const GLuint> shaders, WebShaderProgramSource& source) {
++    source.vertex.clear();
++    source.fragment.clear();
++    for (const GLuint shader : shaders) {
++        const auto it = web_shader_sources.find(shader);
++        if (it == web_shader_sources.end()) {
++            continue;
++        }
++        if (it->second.type == GL_VERTEX_SHADER) {
++            source.vertex = it->second.source;
++        } else if (it->second.type == GL_FRAGMENT_SHADER) {
++            source.fragment = it->second.source;
++        }
++    }
++    if (source.vertex.empty() || source.fragment.empty()) {
++        return false;
++    }
++    source.key = MakeWebShaderProgramKey(source.vertex, source.fragment);
++    return true;
++}
++
++void WriteWebShaderCacheEntry(std::ofstream& file, const WebShaderProgramSource& entry) {
++    const auto vertex_size = static_cast<std::uint32_t>(entry.vertex.size());
++    const auto fragment_size = static_cast<std::uint32_t>(entry.fragment.size());
++    file.write(reinterpret_cast<const char*>(&vertex_size), sizeof(vertex_size));
++    file.write(reinterpret_cast<const char*>(&fragment_size), sizeof(fragment_size));
++    file.write(entry.vertex.data(), static_cast<std::streamsize>(entry.vertex.size()));
++    file.write(entry.fragment.data(), static_cast<std::streamsize>(entry.fragment.size()));
++}
++
++void RewriteWebShaderCache() {
++    std::ofstream file(WEB_SHADER_CACHE_TEMP_PATH, std::ios::binary | std::ios::trunc);
++    if (!file) {
++        LOG_WARNING(Render_OpenGL, "Cannot write web shader cache");
++        return;
++    }
++    file.write(WEB_SHADER_CACHE_MAGIC.data(), WEB_SHADER_CACHE_MAGIC.size());
++    for (const auto& entry : web_shader_cache_entries) {
++        WriteWebShaderCacheEntry(file, entry);
++    }
++    file.close();
++    if (!file || std::rename(WEB_SHADER_CACHE_TEMP_PATH, WEB_SHADER_CACHE_PATH) != 0) {
++        LOG_WARNING(Render_OpenGL, "Cannot replace web shader cache");
++        return;
++    }
++    web_shader_cache_initialized = true;
++    web_shader_cache_bytes = WEB_SHADER_CACHE_MAGIC.size();
++    for (const auto& entry : web_shader_cache_entries) {
++        web_shader_cache_bytes += 2 * sizeof(u32) + entry.vertex.size() + entry.fragment.size();
++    }
++}
++
++void SaveWebShaderProgram(const WebShaderProgramSource& entry) {
++    if (!web_shader_cache_loaded && g_web_shader_mode == 1) {
++        LoadWebShaderProgramCache();
++    }
++    if (entry.vertex.size() > WEB_SHADER_CACHE_MAX_SOURCE_BYTES ||
++        entry.fragment.size() > WEB_SHADER_CACHE_MAX_SOURCE_BYTES ||
++        web_saved_programs.contains(entry.key)) {
++        return;
++    }
++
++    const std::size_t entry_bytes =
++        2 * sizeof(u32) + entry.vertex.size() + entry.fragment.size();
++    if (entry_bytes + WEB_SHADER_CACHE_MAGIC.size() > WEB_SHADER_CACHE_MAX_BYTES) {
++        return;
++    }
++
++    const bool must_rewrite =
++        web_shader_cache_bytes + entry_bytes > WEB_SHADER_CACHE_MAX_BYTES ||
++        web_shader_cache_entries.size() >= WEB_SHADER_CACHE_MAX_ENTRIES;
++    if (must_rewrite) {
++        while (!web_shader_cache_entries.empty() &&
++               (web_shader_cache_bytes + entry_bytes > WEB_SHADER_CACHE_MAX_BYTES ||
++                web_shader_cache_entries.size() >= WEB_SHADER_CACHE_MAX_ENTRIES)) {
++            web_saved_programs.erase(web_shader_cache_entries.front().key);
++            web_shader_cache_bytes -= 2 * sizeof(u32) +
++                                      web_shader_cache_entries.front().vertex.size() +
++                                      web_shader_cache_entries.front().fragment.size();
++            web_shader_cache_entries.erase(web_shader_cache_entries.begin());
++        }
++    }
++
++    if (must_rewrite) {
++        web_shader_cache_entries.push_back(entry);
++        web_saved_programs.insert(entry.key);
++        RewriteWebShaderCache();
++        return;
++    }
++
++    std::ofstream file(WEB_SHADER_CACHE_PATH,
++                       std::ios::binary |
++                           (web_shader_cache_initialized ? std::ios::app : std::ios::trunc));
++    if (!file) {
++        LOG_WARNING(Render_OpenGL, "Cannot open web shader cache for writing");
++        return;
++    }
++    if (!web_shader_cache_initialized) {
++        file.write(WEB_SHADER_CACHE_MAGIC.data(), WEB_SHADER_CACHE_MAGIC.size());
++        if (!file) {
++            LOG_WARNING(Render_OpenGL, "Cannot open web shader cache for writing");
++            return;
++        }
++        web_shader_cache_initialized = true;
++        web_shader_cache_bytes = WEB_SHADER_CACHE_MAGIC.size();
++    }
++    WriteWebShaderCacheEntry(file, entry);
++    if (!file) {
++        LOG_WARNING(Render_OpenGL, "Failed to write web shader cache entry");
++        return;
++    }
++    web_shader_cache_entries.push_back(entry);
++    web_saved_programs.insert(entry.key);
++    web_shader_cache_bytes += entry_bytes;
++}
+ 
+ void LogAttachedShaderErrors(GLuint program_id, const std::string& debug_name) {
+     std::array<GLuint, 4> attached{};
+@@ -87,6 +248,16 @@ void BindWebProgramResources(GLuint program_id) {
+ } // Anonymous namespace
+ 
+ GLuint LoadProgramDeferred(std::span<const GLuint> shaders) {
++    WebShaderProgramSource source;
++    if (GetWebShaderProgramSource(shaders, source)) {
++        const auto preloaded = web_preloaded_programs.find(source.key);
++        if (preloaded != web_preloaded_programs.end()) {
++            const GLuint program_id = preloaded->second;
++            web_preloaded_programs.erase(preloaded);
++            return program_id;
++        }
++    }
++
+     const GLuint program_id = glCreateProgram();
+     for (GLuint shader : shaders) {
+         if (shader != 0) {
+@@ -94,9 +265,126 @@ GLuint LoadProgramDeferred(std::span<const GLuint> shaders) {
+         }
+     }
+     glLinkProgram(program_id);
++    if (!source.key.empty()) {
++        web_pending_program_sources.insert_or_assign(program_id, std::move(source));
++    }
+     return program_id;
+ }
+ 
++void LoadWebShaderProgramCache() {
++    if (web_shader_cache_loaded || g_web_shader_mode != 1) {
++        return;
++    }
++    web_shader_cache_loaded = true;
++
++    std::ifstream file(WEB_SHADER_CACHE_PATH, std::ios::binary);
++    if (!file) {
++        return;
++    }
++
++    std::array<char, WEB_SHADER_CACHE_MAGIC.size()> magic{};
++    file.read(magic.data(), magic.size());
++    if (!file || magic != WEB_SHADER_CACHE_MAGIC) {
++        LOG_WARNING(Render_OpenGL, "Ignoring invalid web shader cache header");
++        web_shader_cache_initialized = false;
++        return;
++    }
++    web_shader_cache_initialized = true;
++    web_shader_cache_bytes = WEB_SHADER_CACHE_MAGIC.size();
++
++    bool rewrite_cache = false;
++    while (file && web_shader_cache_bytes < WEB_SHADER_CACHE_MAX_BYTES) {
++        std::uint32_t vertex_size = 0;
++        std::uint32_t fragment_size = 0;
++        file.read(reinterpret_cast<char*>(&vertex_size), sizeof(vertex_size));
++        if (file.gcount() == 0 && file.eof()) {
++            break;
++        }
++        if (file.gcount() != sizeof(vertex_size)) {
++            rewrite_cache = true;
++            break;
++        }
++        file.read(reinterpret_cast<char*>(&fragment_size), sizeof(fragment_size));
++        if (!file || vertex_size == 0 || fragment_size == 0 ||
++            vertex_size > WEB_SHADER_CACHE_MAX_SOURCE_BYTES ||
++            fragment_size > WEB_SHADER_CACHE_MAX_SOURCE_BYTES ||
++            web_shader_cache_bytes + 2 * sizeof(std::uint32_t) + vertex_size + fragment_size >
++                WEB_SHADER_CACHE_MAX_BYTES) {
++            LOG_WARNING(Render_OpenGL, "Ignoring invalid or truncated web shader cache entry");
++            rewrite_cache = true;
++            break;
++        }
++
++        WebShaderProgramSource entry;
++        entry.vertex.resize(vertex_size);
++        entry.fragment.resize(fragment_size);
++        file.read(entry.vertex.data(), vertex_size);
++        file.read(entry.fragment.data(), fragment_size);
++        if (!file) {
++            LOG_WARNING(Render_OpenGL, "Ignoring truncated web shader cache entry");
++            rewrite_cache = true;
++            break;
++        }
++        entry.key = MakeWebShaderProgramKey(entry.vertex, entry.fragment);
++
++        const auto duplicate = std::find_if(
++            web_shader_cache_entries.begin(), web_shader_cache_entries.end(),
++            [&entry](const WebShaderProgramSource& saved) { return saved.key == entry.key; });
++        if (duplicate != web_shader_cache_entries.end()) {
++            web_shader_cache_bytes -= 2 * sizeof(u32) + duplicate->vertex.size() +
++                                      duplicate->fragment.size();
++            web_shader_cache_entries.erase(duplicate);
++        } else {
++            web_saved_programs.insert(entry.key);
++        }
++        web_shader_cache_bytes += 2 * sizeof(u32) + entry.vertex.size() + entry.fragment.size();
++        web_shader_cache_entries.push_back(std::move(entry));
++        if (web_shader_cache_entries.size() > WEB_SHADER_CACHE_MAX_ENTRIES) {
++            web_saved_programs.erase(web_shader_cache_entries.front().key);
++            web_shader_cache_bytes -= 2 * sizeof(u32) +
++                                      web_shader_cache_entries.front().vertex.size() +
++                                      web_shader_cache_entries.front().fragment.size();
++            web_shader_cache_entries.erase(web_shader_cache_entries.begin());
++        }
++    }
++    if (web_shader_cache_bytes >= WEB_SHADER_CACHE_MAX_BYTES && file.peek() != EOF) {
++        rewrite_cache = true;
++    }
++    if (rewrite_cache) {
++        file.close();
++        RewriteWebShaderCache();
++    }
++
++    const std::size_t max_warmup =
++        HasParallelShaderCompile() ? WEB_SHADER_CACHE_STARTUP_WARMUP : WEB_SHADER_CACHE_SYNC_WARMUP;
++    const std::size_t warmup_start =
++        web_shader_cache_entries.size() > max_warmup
++            ? web_shader_cache_entries.size() - max_warmup
++            : 0;
++    std::size_t warmed = 0;
++    for (std::size_t i = warmup_start; i < web_shader_cache_entries.size(); ++i) {
++        const auto& entry = web_shader_cache_entries[i];
++        const GLuint vertex = LoadShader(entry.vertex, GL_VERTEX_SHADER, "web shader cache");
++        const GLuint fragment = LoadShader(entry.fragment, GL_FRAGMENT_SHADER, "web shader cache");
++        if (vertex == 0 || fragment == 0) {
++            continue;
++        }
++        const std::array shaders{vertex, fragment};
++        const GLuint program_id = glCreateProgram();
++        glAttachShader(program_id, vertex);
++        glAttachShader(program_id, fragment);
++        glLinkProgram(program_id);
++        web_preloaded_programs.insert_or_assign(entry.key, program_id);
++        web_shader_sources.erase(vertex);
++        web_shader_sources.erase(fragment);
++        warmed++;
++    }
++    if (warmed > 0) {
++        LOG_INFO(Render_OpenGL, "Queued {} previously seen web shader programs for warm-up",
++                 warmed);
++    }
++}
++
+ bool HasParallelShaderCompile() {
+     static const bool supported = emscripten_webgl_enable_extension(
+         emscripten_webgl_get_current_context(), "KHR_parallel_shader_compile");
+@@ -116,6 +404,7 @@ bool FinalizeProgram(GLuint program_id, const std::string& debug_name) {
+     GLint result = GL_FALSE;
+     glGetProgramiv(program_id, GL_LINK_STATUS, &result);
+     if (result != GL_TRUE) {
++        web_pending_program_sources.erase(program_id);
+         GLint length = 0;
+         glGetProgramiv(program_id, GL_INFO_LOG_LENGTH, &length);
+         std::vector<char> log(std::max<GLint>(length, 1));
+@@ -124,6 +413,11 @@ bool FinalizeProgram(GLuint program_id, const std::string& debug_name) {
+         LogAttachedShaderErrors(program_id, debug_name);
+         return false;
+     }
++    if (const auto source = web_pending_program_sources.find(program_id);
++        source != web_pending_program_sources.end()) {
++        SaveWebShaderProgram(source->second);
++        web_pending_program_sources.erase(source);
++    }
+     BindWebProgramResources(program_id);
+     return true;
+ }
+@@ -134,6 +428,7 @@ GLuint LoadShader(std::string_view source, GLenum type, const std::string& debug
+     if (type == GL_GEOMETRY_SHADER) {
+         return 0;
+     }
++    const std::string original_source(source);
+     std::string preamble = "#version 300 es\n#define fma(a, b, c) ((a) * (b) + (c))\n";
+     if (type == GL_FRAGMENT_SHADER) {
+         preamble += "precision highp float;\nprecision highp int;\n";
+@@ -254,6 +549,7 @@ GLuint LoadShader(std::string_view source, GLenum type, const std::string& debug
+     }
+ 
+     glShaderSource(shader_id, static_cast<GLsizei>(src_arr.size()), src_arr.data(), lengths.data());
++    web_shader_sources.insert_or_assign(shader_id, WebShaderSource{type, original_source});
+     LOG_DEBUG(Render_OpenGL, "Compiling {} shader {}...", debug_type, debug_name);
+     glCompileShader(shader_id);
+ #ifdef __EMSCRIPTEN__
+@@ -333,6 +629,10 @@ GLuint LoadProgram(bool separable_program, std::span<const GLuint> shaders,
+ #ifdef __EMSCRIPTEN__
+     if (result == GL_TRUE) {
+         BindWebProgramResources(program_id);
++        WebShaderProgramSource source;
++        if (GetWebShaderProgramSource(shaders, source)) {
++            SaveWebShaderProgram(source);
++        }
+     } else {
+         LogAttachedShaderErrors(program_id, debug_name);
+     }
+diff --git a/src/video_core/renderer_opengl/gl_shader_util.h b/src/video_core/renderer_opengl/gl_shader_util.h
+index d926059..c3b7664 100644
+--- a/src/video_core/renderer_opengl/gl_shader_util.h
++++ b/src/video_core/renderer_opengl/gl_shader_util.h
+@@ -36,6 +36,9 @@ extern int g_web_shader_mode;
+ /// Starts linking a program without any blocking status query (KHR_parallel_shader_compile).
+ GLuint LoadProgramDeferred(std::span<const GLuint> shaders);
+ 
++/// Loads previously seen web shader programs and queues them for compilation during startup.
++void LoadWebShaderProgramCache();
++
+ /// Whether the context exposes KHR_parallel_shader_compile (enables it on first call).
+ bool HasParallelShaderCompile();
+ 
+diff --git a/src/video_core/renderer_opengl/gl_shader_manager.cpp b/src/video_core/renderer_opengl/gl_shader_manager.cpp
+index ed1d397..88c1402 100644
+--- a/src/video_core/renderer_opengl/gl_shader_manager.cpp
++++ b/src/video_core/renderer_opengl/gl_shader_manager.cpp
+@@ -337,6 +337,7 @@ public:
+     std::unordered_map<u64, OGLProgram> program_cache;
+ #ifdef __EMSCRIPTEN__
+     std::unordered_set<GLuint> pending_programs;
++    std::unordered_set<GLuint> failed_programs;
+ #endif
+     OGLPipeline pipeline;
+     ShaderDiskCache disk_cache;
+@@ -466,18 +467,28 @@ bool ShaderProgramManager::ApplyTo(OpenGLState& state, bool accurate_mul, bool w
+         if (g_web_shader_mode == 1) {
+             // Link in the background (KHR_parallel_shader_compile) and skip draws until it is
+             // ready, like the Vulkan async shader path, instead of stalling the frame.
++            PumpWebShaderWarmup();
+             if (cached_program.handle == 0) {
+                 cached_program.handle = LoadProgramDeferred(
+                     std::array{impl->current.vs, impl->current.gs, impl->current.fs});
+                 impl->pending_programs.insert(cached_program.handle);
+             }
++            if (impl->failed_programs.contains(cached_program.handle)) {
++                return false;
++            }
+             if (impl->pending_programs.contains(cached_program.handle)) {
++                // Draws of 6 vertices or fewer (copies, UI quads) cannot be skipped without
++                // losing visible content, so they still wait for the link.
+                 if (!wait_built && !IsProgramLinkDone(cached_program.handle)) {
+                     return false;
+                 }
+-                FinalizeProgram(cached_program.handle,
+-                                fmt::format("{:016x}", unique_identifier));
++                const bool linked = FinalizeProgram(cached_program.handle,
++                                                    fmt::format("{:016x}", unique_identifier));
+                 impl->pending_programs.erase(cached_program.handle);
++                if (!linked) {
++                    impl->failed_programs.insert(cached_program.handle);
++                    return false;
++                }
+             }
+             state.draw.shader_program = cached_program.handle;
+             return true;
+@@ -646,6 +657,7 @@ void ShaderProgramManager::LoadDiskCache(const std::atomic_bool& stop_loading,
+         impl->program_cache.clear();
+ #ifdef __EMSCRIPTEN__
+         impl->pending_programs.clear();
++        impl->failed_programs.clear();
+ #endif
+         disk_cache.InvalidatePrecompiled();
+         dumps.clear();
+diff --git a/src/video_core/renderer_opengl/gl_shader_util.cpp b/src/video_core/renderer_opengl/gl_shader_util.cpp
+index 541e6cf..69e1654 100644
+--- a/src/video_core/renderer_opengl/gl_shader_util.cpp
++++ b/src/video_core/renderer_opengl/gl_shader_util.cpp
+@@ -4,8 +4,10 @@
+ 
+ #include <algorithm>
+ #include <array>
++#include <chrono>
+ #include <cstdint>
+ #include <cstdio>
++#include <deque>
+ #include <fstream>
+ #include <string>
+ #include <unordered_map>
+@@ -34,8 +36,13 @@ constexpr std::array<char, 8> WEB_SHADER_CACHE_MAGIC{'G', 'B', '3', 'D', 'S', 'S
+ constexpr std::size_t WEB_SHADER_CACHE_MAX_BYTES = 4 * 1024 * 1024;
+ constexpr std::size_t WEB_SHADER_CACHE_MAX_ENTRIES = 256;
+ constexpr std::size_t WEB_SHADER_CACHE_MAX_SOURCE_BYTES = 256 * 1024;
+-constexpr std::size_t WEB_SHADER_CACHE_STARTUP_WARMUP = 24;
++// Without KHR_parallel_shader_compile a link blocks the calling thread, so only a few programs are
++// warmed up. With it, every cached program is warmed up in small time-boxed batches.
+ constexpr std::size_t WEB_SHADER_CACHE_SYNC_WARMUP = 4;
++constexpr std::size_t WEB_SHADER_WARMUP_MAX_INFLIGHT = 4;
++constexpr std::size_t WEB_SHADER_WARMUP_SUBMITS_PER_PUMP = 2;
++constexpr std::chrono::milliseconds WEB_SHADER_WARMUP_PUMP_INTERVAL{4};
++constexpr std::chrono::milliseconds WEB_SHADER_WARMUP_PUMP_BUDGET{2};
+ 
+ struct WebShaderSource {
+     GLenum type;
+@@ -52,6 +59,16 @@ std::unordered_map<GLuint, WebShaderSource> web_shader_sources;
+ std::unordered_map<GLuint, WebShaderProgramSource> web_pending_program_sources;
+ std::unordered_map<std::string, GLuint> web_preloaded_programs;
+ std::unordered_set<std::string> web_saved_programs;
++struct WebWarmupInflight {
++    std::string key;
++    GLuint program;
++};
++std::deque<WebShaderProgramSource> web_warmup_queue;
++std::unordered_set<std::string> web_warmup_queued_keys;
++std::vector<WebWarmupInflight> web_warmup_inflight;
++std::chrono::steady_clock::time_point web_warmup_last_pump{};
++std::size_t web_warmup_total = 0;
++std::size_t web_warmup_failed = 0;
+ std::vector<WebShaderProgramSource> web_shader_cache_entries;
+ std::size_t web_shader_cache_bytes = WEB_SHADER_CACHE_MAGIC.size();
+ bool web_shader_cache_loaded = false;
+@@ -256,6 +273,8 @@ GLuint LoadProgramDeferred(std::span<const GLuint> shaders) {
+             web_preloaded_programs.erase(preloaded);
+             return program_id;
+         }
++        // Requested before the warm-up reached it: this link replaces the queued one.
++        web_warmup_queued_keys.erase(source.key);
+     }
+ 
+     const GLuint program_id = glCreateProgram();
+@@ -355,33 +374,23 @@ void LoadWebShaderProgramCache() {
+         RewriteWebShaderCache();
+     }
+ 
+-    const std::size_t max_warmup =
+-        HasParallelShaderCompile() ? WEB_SHADER_CACHE_STARTUP_WARMUP : WEB_SHADER_CACHE_SYNC_WARMUP;
+-    const std::size_t warmup_start =
+-        web_shader_cache_entries.size() > max_warmup
+-            ? web_shader_cache_entries.size() - max_warmup
+-            : 0;
+-    std::size_t warmed = 0;
+-    for (std::size_t i = warmup_start; i < web_shader_cache_entries.size(); ++i) {
+-        const auto& entry = web_shader_cache_entries[i];
+-        const GLuint vertex = LoadShader(entry.vertex, GL_VERTEX_SHADER, "web shader cache");
+-        const GLuint fragment = LoadShader(entry.fragment, GL_FRAGMENT_SHADER, "web shader cache");
+-        if (vertex == 0 || fragment == 0) {
+-            continue;
++    const std::size_t max_warmup = HasParallelShaderCompile() ? web_shader_cache_entries.size()
++                                                              : WEB_SHADER_CACHE_SYNC_WARMUP;
++    const std::size_t warmup_start = web_shader_cache_entries.size() > max_warmup
++                                         ? web_shader_cache_entries.size() - max_warmup
++                                         : 0;
++    // Newest first: the programs seen most recently are the most likely to be needed again.
++    for (std::size_t i = web_shader_cache_entries.size(); i > warmup_start; --i) {
++        const auto& entry = web_shader_cache_entries[i - 1];
++        if (web_warmup_queued_keys.insert(entry.key).second) {
++            web_warmup_queue.push_back(entry);
+         }
+-        const std::array shaders{vertex, fragment};
+-        const GLuint program_id = glCreateProgram();
+-        glAttachShader(program_id, vertex);
+-        glAttachShader(program_id, fragment);
+-        glLinkProgram(program_id);
+-        web_preloaded_programs.insert_or_assign(entry.key, program_id);
+-        web_shader_sources.erase(vertex);
+-        web_shader_sources.erase(fragment);
+-        warmed++;
+     }
+-    if (warmed > 0) {
+-        LOG_INFO(Render_OpenGL, "Queued {} previously seen web shader programs for warm-up",
+-                 warmed);
++    web_warmup_total = web_warmup_queue.size();
++    if (web_warmup_total > 0) {
++        LOG_INFO(Render_OpenGL,
++                 "Queued {} previously seen web shader programs for batched warm-up",
++                 web_warmup_total);
+     }
+ }
+ 
+@@ -421,6 +430,99 @@ bool FinalizeProgram(GLuint program_id, const std::string& debug_name) {
+     BindWebProgramResources(program_id);
+     return true;
+ }
++
++namespace {
++bool SubmitWebWarmupProgram(const WebShaderProgramSource& entry) {
++    const GLuint vertex = LoadShader(entry.vertex, GL_VERTEX_SHADER, "web shader cache");
++    const GLuint fragment = LoadShader(entry.fragment, GL_FRAGMENT_SHADER, "web shader cache");
++    web_shader_sources.erase(vertex);
++    web_shader_sources.erase(fragment);
++    if (vertex == 0 || fragment == 0) {
++        if (vertex != 0) {
++            glDeleteShader(vertex);
++        }
++        if (fragment != 0) {
++            glDeleteShader(fragment);
++        }
++        return false;
++    }
++    const GLuint program_id = glCreateProgram();
++    glAttachShader(program_id, vertex);
++    glAttachShader(program_id, fragment);
++    glLinkProgram(program_id);
++    // Deletion is deferred by GL until the program itself is deleted.
++    glDeleteShader(vertex);
++    glDeleteShader(fragment);
++    web_preloaded_programs.insert_or_assign(entry.key, program_id);
++    web_warmup_inflight.push_back({entry.key, program_id});
++    return true;
++}
++
++void ReapWebWarmupPrograms() {
++    for (auto it = web_warmup_inflight.begin(); it != web_warmup_inflight.end();) {
++        const auto preloaded = web_preloaded_programs.find(it->key);
++        if (preloaded == web_preloaded_programs.end() || preloaded->second != it->program) {
++            // A draw already took ownership of this program; it validates the link itself.
++            it = web_warmup_inflight.erase(it);
++            continue;
++        }
++        if (!IsProgramLinkDone(it->program)) {
++            ++it;
++            continue;
++        }
++        GLint result = GL_FALSE;
++        glGetProgramiv(it->program, GL_LINK_STATUS, &result);
++        if (result != GL_TRUE) {
++            GLint length = 0;
++            glGetProgramiv(it->program, GL_INFO_LOG_LENGTH, &length);
++            std::vector<char> log(std::max<GLint>(length, 1));
++            glGetProgramInfoLog(it->program, length, nullptr, log.data());
++            LOG_ERROR(Render_OpenGL, "Error linking cached web shader program:\n{}", log.data());
++            LogAttachedShaderErrors(it->program, "web shader cache");
++            glDeleteProgram(it->program);
++            web_preloaded_programs.erase(preloaded);
++            web_warmup_failed++;
++        }
++        it = web_warmup_inflight.erase(it);
++    }
++}
++} // Anonymous namespace
++
++void PumpWebShaderWarmup() {
++    if (web_warmup_queue.empty() && web_warmup_inflight.empty()) {
++        return;
++    }
++    using Clock = std::chrono::steady_clock;
++    const auto start = Clock::now();
++    if (start - web_warmup_last_pump < WEB_SHADER_WARMUP_PUMP_INTERVAL) {
++        return;
++    }
++    web_warmup_last_pump = start;
++
++    ReapWebWarmupPrograms();
++
++    std::size_t submitted = 0;
++    while (!web_warmup_queue.empty() && web_warmup_inflight.size() < WEB_SHADER_WARMUP_MAX_INFLIGHT &&
++           submitted < WEB_SHADER_WARMUP_SUBMITS_PER_PUMP &&
++           Clock::now() - start < WEB_SHADER_WARMUP_PUMP_BUDGET) {
++        WebShaderProgramSource entry = std::move(web_warmup_queue.front());
++        web_warmup_queue.pop_front();
++        if (web_warmup_queued_keys.erase(entry.key) == 0 ||
++            web_preloaded_programs.contains(entry.key)) {
++            continue;
++        }
++        if (!SubmitWebWarmupProgram(entry)) {
++            web_warmup_failed++;
++            continue;
++        }
++        submitted++;
++    }
++
++    if (web_warmup_queue.empty() && web_warmup_inflight.empty()) {
++        LOG_INFO(Render_OpenGL, "Web shader warm-up finished: {} queued, {} failed",
++                 web_warmup_total, web_warmup_failed);
++    }
++}
+ #endif
+ 
+ GLuint LoadShader(std::string_view source, GLenum type, const std::string& debug_name) {
+diff --git a/src/video_core/renderer_opengl/gl_shader_util.h b/src/video_core/renderer_opengl/gl_shader_util.h
+index c3b7664..8fc1434 100644
+--- a/src/video_core/renderer_opengl/gl_shader_util.h
++++ b/src/video_core/renderer_opengl/gl_shader_util.h
+@@ -36,9 +36,13 @@ extern int g_web_shader_mode;
+ /// Starts linking a program without any blocking status query (KHR_parallel_shader_compile).
+ GLuint LoadProgramDeferred(std::span<const GLuint> shaders);
+ 
+-/// Loads previously seen web shader programs and queues them for compilation during startup.
++/// Reads the persisted web shader cache and queues its programs for batched warm-up.
+ void LoadWebShaderProgramCache();
+ 
++/// Submits a time-boxed batch of queued warm-up links and validates finished ones. Cheap when
++/// idle; call from the GL thread (e.g. once per draw).
++void PumpWebShaderWarmup();
++
+ /// Whether the context exposes KHR_parallel_shader_compile (enables it on first call).
+ bool HasParallelShaderCompile();
+ 
+diff --git a/src/video_core/renderer_opengl/gl_shader_manager.cpp b/src/video_core/renderer_opengl/gl_shader_manager.cpp
+index 88c1402..afccc8f 100644
+--- a/src/video_core/renderer_opengl/gl_shader_manager.cpp
++++ b/src/video_core/renderer_opengl/gl_shader_manager.cpp
+@@ -467,7 +467,9 @@ bool ShaderProgramManager::ApplyTo(OpenGLState& state, bool accurate_mul, bool w
+         if (g_web_shader_mode == 1) {
+             // Link in the background (KHR_parallel_shader_compile) and skip draws until it is
+             // ready, like the Vulkan async shader path, instead of stalling the frame.
+-            PumpWebShaderWarmup();
++            if (HasParallelShaderCompile()) {
++                PumpWebShaderWarmup();
++            }
+             if (cached_program.handle == 0) {
+                 cached_program.handle = LoadProgramDeferred(
+                     std::array{impl->current.vs, impl->current.gs, impl->current.fs});
+@@ -477,9 +479,9 @@ bool ShaderProgramManager::ApplyTo(OpenGLState& state, bool accurate_mul, bool w
+                 return false;
+             }
+             if (impl->pending_programs.contains(cached_program.handle)) {
+-                // Draws of 6 vertices or fewer (copies, UI quads) cannot be skipped without
+-                // losing visible content, so they still wait for the link.
+-                if (!wait_built && !IsProgramLinkDone(cached_program.handle)) {
++                // Never block on an unfinished link, whatever the draw size: a brief visual
++                // fallback is preferred over a gameplay stall.
++                if (!IsProgramLinkDone(cached_program.handle)) {
+                     return false;
+                 }
+                 const bool linked = FinalizeProgram(cached_program.handle,
+diff --git a/src/video_core/renderer_opengl/gl_shader_manager.h b/src/video_core/renderer_opengl/gl_shader_manager.h
+index 253f1f8..df2f627 100644
+--- a/src/video_core/renderer_opengl/gl_shader_manager.h
++++ b/src/video_core/renderer_opengl/gl_shader_manager.h
+@@ -53,7 +53,8 @@ public:
+     void UseFragmentShader(const Pica::RegsInternal& config, const Pica::Shader::UserConfig& user);
+ 
+     /// Binds the current program. Returns false when the program is still being built
+-    /// asynchronously and wait_built is false; the caller should skip the draw.
++    /// asynchronously; the caller should skip the draw. In web async shader mode wait_built is
++    /// ignored and an unfinished link is never waited for.
+     bool ApplyTo(OpenGLState& state, bool accurate_mul, bool wait_built = true);
+ 
+     u64 GetProgramID() const;
+diff --git a/src/video_core/renderer_opengl/gl_shader_util.cpp b/src/video_core/renderer_opengl/gl_shader_util.cpp
+index 69e1654..aff8a70 100644
+--- a/src/video_core/renderer_opengl/gl_shader_util.cpp
++++ b/src/video_core/renderer_opengl/gl_shader_util.cpp
+@@ -262,6 +262,8 @@ void BindWebProgramResources(GLuint program_id) {
+     }
+     glUseProgram(static_cast<GLuint>(prev_program));
+ }
++
++bool SubmitWebWarmupProgram(const WebShaderProgramSource& entry);
+ } // Anonymous namespace
+ 
+ GLuint LoadProgramDeferred(std::span<const GLuint> shaders) {
+@@ -374,23 +376,35 @@ void LoadWebShaderProgramCache() {
+         RewriteWebShaderCache();
+     }
+ 
+-    const std::size_t max_warmup = HasParallelShaderCompile() ? web_shader_cache_entries.size()
+-                                                              : WEB_SHADER_CACHE_SYNC_WARMUP;
++    const bool parallel_compile = HasParallelShaderCompile();
++    const std::size_t max_warmup =
++        parallel_compile ? web_shader_cache_entries.size() : WEB_SHADER_CACHE_SYNC_WARMUP;
+     const std::size_t warmup_start = web_shader_cache_entries.size() > max_warmup
+                                          ? web_shader_cache_entries.size() - max_warmup
+                                          : 0;
+     // Newest first: the programs seen most recently are the most likely to be needed again.
+     for (std::size_t i = web_shader_cache_entries.size(); i > warmup_start; --i) {
+         const auto& entry = web_shader_cache_entries[i - 1];
+-        if (web_warmup_queued_keys.insert(entry.key).second) {
+-            web_warmup_queue.push_back(entry);
++        if (parallel_compile) {
++            if (web_warmup_queued_keys.insert(entry.key).second) {
++                web_warmup_queue.push_back(entry);
++            }
++        } else if (SubmitWebWarmupProgram(entry)) {
++            web_warmup_total++;
++        } else {
++            web_warmup_failed++;
+         }
+     }
+-    web_warmup_total = web_warmup_queue.size();
++    if (parallel_compile) {
++        web_warmup_total = web_warmup_queue.size();
++    } else {
++        // Links are synchronous here and finish before this function returns; draws validate
++        // them through FinalizeProgram, so nothing needs tracking or pumping afterwards.
++        web_warmup_inflight.clear();
++    }
+     if (web_warmup_total > 0) {
+-        LOG_INFO(Render_OpenGL,
+-                 "Queued {} previously seen web shader programs for batched warm-up",
+-                 web_warmup_total);
++        LOG_INFO(Render_OpenGL, "Warming up {} previously seen web shader programs ({})",
++                 web_warmup_total, parallel_compile ? "batched" : "synchronous at startup");
+     }
+ }
+ 
+@@ -489,7 +503,9 @@ void ReapWebWarmupPrograms() {
+ } // Anonymous namespace
+ 
+ void PumpWebShaderWarmup() {
+-    if (web_warmup_queue.empty() && web_warmup_inflight.empty()) {
++    // Without KHR_parallel_shader_compile every link blocks, so warm-up never runs mid-render.
++    if (!HasParallelShaderCompile() ||
++        (web_warmup_queue.empty() && web_warmup_inflight.empty())) {
+         return;
+     }
+     using Clock = std::chrono::steady_clock;
