@@ -7,6 +7,7 @@ on:
     paths:
       - "gaemboy-3ds-web-master.zip"
       - ".github/workflows/build-and-deploy.yml"
+      - "scripts/**"
 
 permissions:
   contents: read
