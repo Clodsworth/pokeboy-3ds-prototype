@@ -199,6 +199,8 @@ renderKeyBindings();
 if (!js.includes(resetAnchor)) throw new Error('Could not find the UI initialization insertion point.');
 js = js.replace(resetAnchor, resetAnchor + resetCode);
 
+if (!html.includes('id="key-config"')) throw new Error('Could not add the custom keyboard controls panel to index.html.');
+
 await writeFile(htmlPath, html);
 await writeFile(jsPath, js);
 console.log('Applied PokéBoy English UI and customizable keyboard controls.');
