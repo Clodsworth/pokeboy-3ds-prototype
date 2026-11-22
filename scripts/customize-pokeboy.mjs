@@ -62,7 +62,7 @@ html = html.replace('<html lang="it">', '<html lang="en">')
   .replace('Codice sorgente', 'Source code')
   .replace('basato su', 'based on')
   .replace('Non affiliato a Nintendo; nessun gioco, BIOS o chiave incluso.', 'Not affiliated with Nintendo; no games, BIOS, or keys included.')
-  .replace('  <div class="keys">\n      <b>Keyboard</b>:', '  <section id="key-config" aria-label="Custom keyboard controls"><h3>Custom keyboard controls</h3><p>Choose a control, then press the key you want to assign. Changes are saved on this device.</p><div id="key-bindings"></div><button id="reset-key-bindings" type="button" class="alt">Reset default keys</button><p id="key-bind-status" role="status" aria-live="polite"></p></section>\n  <div class="keys">\n      <b>Keyboard</b>:');
+  .replace('<div class="keys">', '<section id="key-config" aria-label="Custom keyboard controls"><h3>Custom keyboard controls</h3><p>Choose a control, then press the key you want to assign. Changes are saved on this device.</p><div id="key-bindings"></div><button id="reset-key-bindings" type="button" class="alt">Reset default keys</button><p id="key-bind-status" role="status" aria-live="polite"></p></section>\\n    <div class="keys">'));
 
 const oldMap = `const KEYMAP = {
   ArrowUp: 4, ArrowDown: 5, ArrowLeft: 6, ArrowRight: 7, KeyX: 8, KeyZ: 0, KeyS: 9, KeyA: 1,
