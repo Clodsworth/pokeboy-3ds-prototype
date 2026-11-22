@@ -1,0 +1,97 @@
+name: Build and deploy PokéBoy
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - "gaemboy-3ds-web-master.zip"
+      - ".github/workflows/build-and-deploy.yml"
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out project
+        uses: actions/checkout@v4
+
+      - name: Set up Emscripten
+        uses: mymindstorm/setup-emsdk@v14
+        with:
+          version: 3.1.74
+
+      - name: Install build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build python3 git unzip
+
+      - name: Extract original GAEMBOY source
+        id: source
+        shell: bash
+        run: |
+          mkdir -p "$RUNNER_TEMP/pokeboy-source"
+          unzip -q gaemboy-3ds-web-master.zip -d "$RUNNER_TEMP/pokeboy-source"
+          BUILD_SCRIPT="$(find "$RUNNER_TEMP/pokeboy-source" -path '*/azahar-web/scripts/build.sh' -print -quit)"
+          if [ -z "$BUILD_SCRIPT" ]; then
+            echo "Could not find azahar-web/scripts/build.sh inside the source archive."
+            echo "Archive contents:"
+            find "$RUNNER_TEMP/pokeboy-source" -maxdepth 4 -type f | head -80
+            exit 1
+          fi
+          PROJECT_ROOT="${BUILD_SCRIPT%/azahar-web/scripts/build.sh}"
+          echo "project_root=$PROJECT_ROOT" >> "$GITHUB_OUTPUT"
+          echo "Using source tree: $PROJECT_ROOT"
+
+      - name: Run source tests
+        working-directory: ${{ steps.source.outputs.project_root }}
+        run: node --test azahar-web/tests/*.test.mjs
+        env:
+          PATH: /opt/hostedtoolcache/node/22.*/x64/bin:${{ env.PATH }}
+
+      - name: Fetch pinned Azahar sources and apply patches
+        working-directory: ${{ steps.source.outputs.project_root }}
+        run: bash azahar-web/scripts/fetch-azahar-full.sh
+
+      - name: Build WebAssembly emulator
+        working-directory: ${{ steps.source.outputs.project_root }}
+        shell: bash
+        run: |
+          # The upstream script used macOS's sysctl; GitHub's Linux runner uses nproc.
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path("azahar-web/scripts/build.sh")
+          s = p.read_text()
+          old = '$(sysctl -n hw.ncpu)'
+          if old not in s:
+              raise SystemExit("Expected parallel-build command not found in build.sh")
+          p.write_text(s.replace(old, '$(nproc)'))
+          PY
+          bash azahar-web/scripts/build.sh
+
+      - name: Configure GitHub Pages
+        uses: actions/configure-pages@v5
+
+      - name: Upload website
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: ${{ steps.source.outputs.project_root }}/azahar-web/dist
+
+  deploy:
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
