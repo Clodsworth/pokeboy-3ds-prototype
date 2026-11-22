@@ -56,6 +56,10 @@ jobs:
           echo "project_root=$PROJECT_ROOT" >> "$GITHUB_OUTPUT"
           echo "Using source tree: $PROJECT_ROOT"
 
+      - name: Apply PokéBoy English UI and custom controls
+        working-directory: ${{ steps.source.outputs.project_root }}
+        run: node "$GITHUB_WORKSPACE/scripts/customize-pokeboy.mjs"
+
       - name: Run source tests
         working-directory: ${{ steps.source.outputs.project_root }}
         run: node --test azahar-web/tests/*.test.mjs
