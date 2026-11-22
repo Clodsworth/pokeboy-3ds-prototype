@@ -123,7 +123,7 @@ function renderKeyBindings() {
     key.textContent = waitingForKey?.id === binding.id ? 'Press a key…' : keyLabel(code);
     key.onclick = () => {
       waitingForKey = binding;
-      $('key-bind-status').textContent = `Press a key for ${label} (Esc to cancel).`;
+      $('key-bind-status').textContent = 'Press a key for ' + label + ' (Esc to cancel).';
       renderKeyBindings();
     };
     row.append(name, key);
@@ -134,7 +134,7 @@ function renderKeyBindings() {
   }
   for (const [axis, dir, label] of STICK_NAMES) {
     addRow(label, Object.keys(STICK_KEYS).find((code) => STICK_KEYS[code][0] === axis && STICK_KEYS[code][1] === dir),
-      { type: 'stick', id: `${axis}:${dir}`, axis, dir });
+      { type: 'stick', id: axis + ':' + dir, axis, dir });
   }
 }
 function assignKey(code) {
